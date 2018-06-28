@@ -14,16 +14,17 @@ E='-e'
 if [[ "$OSTYPE" == "linux-gnu" ]]; then
 	echo $E "${GREEN}Linux-GNU detected${END_COLOR}"
 	OS="linux"
-elif [[ "$OSTYPE" == "darwin" ]]; then
+elif [[ $OSTYPE =~ darwin. ]]; then
 	E=''
-	echo $E "${GREEN}OSX darwin detected${END_COLOR}"
 	OS="darwin"
-	RED="^[[31m"
-	BLUE="^[[34m"
-	GREEN="^[[32m]"
-	END_COLOR="^[[0m"
-else 
+	RED="[31m"
+	BLUE="[34m"
+	GREEN="[32m"
+	END_COLOR="[0m"
+	echo $E "${GREEN}OSX darwin detected${END_COLOR}"
+else
 	echo $E "OS not supported"
+    echo "$OSTYPE"
 fi
 
 # Check if tools are needed.
