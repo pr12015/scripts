@@ -7,9 +7,9 @@ cd ~
 
 read -p "Enter branch name" branch
 
-sudo apt-get update
+sudo apt-get -y update
 
-sudo apt-get install gcc\
+sudo apt-get -y install gcc\
 	             g++\
 		     cmake\
 		     cmake-curses-gui\
