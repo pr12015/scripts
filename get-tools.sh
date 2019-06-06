@@ -6,9 +6,7 @@ sudo apt-get install gcc\
 	             g++\
 		     cmake\
 		     cmake-curses-gui\
-		     libncurses-dev\
-		     llvm\
-		     clang\
+		     clang-7\
 		     make\
 		     git\
 		     ninja-build\
