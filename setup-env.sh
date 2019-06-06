@@ -3,6 +3,8 @@
 # Get needed tools, clone llvm (branch optional)
 # build Release+Asserts
 
+cd ~
+
 read -p "Enter branch name" branch
 
 sudo apt-get update
