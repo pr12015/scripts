@@ -1,21 +1,26 @@
-import json
+import json, sys
 from pprint import pprint
-
-with open('data.json') as f:
-    data = json.load(f)
 
 nounwind_attributor = 0
 nounwind_functionattrs = 0
 
-for key, value in data.items():
-    if(key == "attributor.NumFnNoUnwind"):
-        num = int(value)
-        nounwind_attributor += num
-    else if(key == "functionattrs.NumNoUnwind"):
-        num = int(value)
-        nounwind_functionattrs += num
+with open(sys.argv[1]) as f:
+    data = json.load(f)
+
+    for key1, value1 in data.items():
+        print key1
+        if key1 == 'tests':
+            for test in value1:
+                # pprint(test)
+                for key, value in test.items():
+                    if key == 'metrics':
+                        for attr, strnum in value.items():
+                            if attr.encode("ascii") == "attributor.NumFnNoUnwind":
+                                num = float(strnum)
+                                nounwind_attributor += num
+                            elif(attr.encode("ascii") == "functionattrs.NumNoUnwind"):
+                                num = float(strnum)
+                                nounwind_functionattrs += num
 
 print("attributor.NumFnNoUnwind: " + str(nounwind_attributor))
 print("functionattrs.NumNoUnwind: " + str(nounwind_functionattrs))
-
-pprint(data)
