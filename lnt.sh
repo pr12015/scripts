@@ -1,0 +1,13 @@
+lnt runtest test-suite \
+	--sandbox ~/lnt-result \
+	--cc ~/release+assert/bin/clang \
+        --cxx ~/release+assert/bin/clang++ \
+	--use-cmake=/usr/bin/cmake \
+	--use-lit=~/llvm-project/llvm/utils/lit/lit.py \
+	--test-suite ~/llvm-test-suite \
+	--cmake-cache Release \
+	--cflags "-O3" \
+	--cxxflags "-O3" \
+	--build-threads 16 \
+	--cmake-define=TEST_SUITE_COLLECT_STATS=ON \
+	-j 16 \
