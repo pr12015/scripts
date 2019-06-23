@@ -9,7 +9,7 @@ END="\e[0m"
 
 cd ~
 
-read -p "Enter branch name" branch
+read -p "Enter branch name: " branch
 mkdir $branch
 cd $branch
 
