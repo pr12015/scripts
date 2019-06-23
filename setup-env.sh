@@ -34,7 +34,7 @@ cd release+assert
 
 read -p "Build clang? (Y/n): " -n 1 -r
 echo
-if [[ $REPLY =~ ^[Yy]$ ]] then
+if [[ $REPLY =~ ^[Yy]$ ]]; then
     cmake -G Ninja -DLLVM_ENABLE_PROJECTS='clang' -DLLVM_ENABLE_ASSERTIONS=ON \
                    -DCMAKE_CXX_COMPILER=clang++-7 -DCMAKE_BUILD_TYPE=Release ../llvm-project/llvm
 else
