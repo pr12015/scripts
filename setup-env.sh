@@ -21,7 +21,9 @@ sudo apt-get -y install gcc\
 		     cmake-curses-gui\
 		     clang-7\
 		     ninja-build\
-                     gdb
+                     gdb\
+                     python\
+                     python-pip
 
 clear
 echo -e "${BLUE}Cloning $branch branch.${END}"
@@ -48,3 +50,7 @@ echo
 echo -e "${BLUE}Build started...${END}"
 
 ninja
+
+cd ~
+git clone https://github.com/llvm/llvm-test-suite.git
+git clone https://github.com/llvm/llvm-lnt.git
