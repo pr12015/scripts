@@ -1,0 +1,1638 @@
+diff --git a/llvm/docs/LangRef.rst b/llvm/docs/LangRef.rst
+index 6e99f25b572..c6c2cdff257 100644
+--- a/llvm/docs/LangRef.rst
++++ b/llvm/docs/LangRef.rst
+@@ -1133,10 +1133,6 @@ Currently, only the following parameter attributes are defined:
+     attribute for return values.  Addresses used in volatile operations
+     are considered to be captured.
+ 
+-``nofree``
+-    This indicates that callee does not free the pointer argument. This is not
+-    a valid attribute for return values.
+-
+ .. _nest:
+ 
+ ``nest``
+diff --git a/llvm/lib/AsmParser/LLParser.cpp b/llvm/lib/AsmParser/LLParser.cpp
+index 042f324249f..db78fa38368 100644
+--- a/llvm/lib/AsmParser/LLParser.cpp
++++ b/llvm/lib/AsmParser/LLParser.cpp
+@@ -1636,7 +1636,6 @@ bool LLParser::ParseOptionalParamAttrs(AttrBuilder &B) {
+     case lltok::kw_nest:            B.addAttribute(Attribute::Nest); break;
+     case lltok::kw_noalias:         B.addAttribute(Attribute::NoAlias); break;
+     case lltok::kw_nocapture:       B.addAttribute(Attribute::NoCapture); break;
+-    case lltok::kw_nofree:          B.addAttribute(Attribute::NoFree); break;
+     case lltok::kw_nonnull:         B.addAttribute(Attribute::NonNull); break;
+     case lltok::kw_readnone:        B.addAttribute(Attribute::ReadNone); break;
+     case lltok::kw_readonly:        B.addAttribute(Attribute::ReadOnly); break;
+diff --git a/llvm/lib/IR/Verifier.cpp b/llvm/lib/IR/Verifier.cpp
+index e89d8b0a9b5..497dc394d96 100644
+--- a/llvm/lib/IR/Verifier.cpp
++++ b/llvm/lib/IR/Verifier.cpp
+@@ -1506,6 +1506,7 @@ static bool isFuncOnlyAttr(Attribute::AttrKind Kind) {
+   case Attribute::NoCfCheck:
+   case Attribute::NoUnwind:
+   case Attribute::NoInline:
++  case Attribute::NoFree:
+   case Attribute::AlwaysInline:
+   case Attribute::OptimizeForSize:
+   case Attribute::StackProtect:
+@@ -1554,7 +1555,7 @@ static bool isFuncOnlyAttr(Attribute::AttrKind Kind) {
+ /// arguments.
+ static bool isFuncOrArgAttr(Attribute::AttrKind Kind) {
+   return Kind == Attribute::ReadOnly || Kind == Attribute::WriteOnly ||
+-         Kind == Attribute::ReadNone || Kind == Attribute::NoFree;
++         Kind == Attribute::ReadNone;
+ }
+ 
+ void Verifier::verifyAttributeTypes(AttributeSet Attrs, bool IsFunction,
+@@ -1701,12 +1702,11 @@ void Verifier::verifyFunctionAttrs(FunctionType *FT, AttributeList Attrs,
+           !RetAttrs.hasAttribute(Attribute::Nest) &&
+           !RetAttrs.hasAttribute(Attribute::StructRet) &&
+           !RetAttrs.hasAttribute(Attribute::NoCapture) &&
+-          !RetAttrs.hasAttribute(Attribute::NoFree) &&
+           !RetAttrs.hasAttribute(Attribute::Returned) &&
+           !RetAttrs.hasAttribute(Attribute::InAlloca) &&
+           !RetAttrs.hasAttribute(Attribute::SwiftSelf) &&
+           !RetAttrs.hasAttribute(Attribute::SwiftError)),
+-         "Attributes 'byval', 'inalloca', 'nest', 'sret', 'nocapture', 'nofree'"
++         "Attributes 'byval', 'inalloca', 'nest', 'sret', 'nocapture', "
+          "'returned', 'swiftself', and 'swifterror' do not apply to return "
+          "values!",
+          V);
+diff --git a/llvm/lib/Transforms/IPO/Attributor.cpp b/llvm/lib/Transforms/IPO/Attributor.cpp
+index 9aabafa1396..6589b16348f 100644
+--- a/llvm/lib/Transforms/IPO/Attributor.cpp
++++ b/llvm/lib/Transforms/IPO/Attributor.cpp
+@@ -580,8 +580,7 @@ struct AAComposeTwoGenericDeduction
+ 
+   /// See AbstractAttribute::updateImpl(...).
+   ChangeStatus updateImpl(Attributor &A) override {
+-    ChangeStatus ChangedF =
+-        F<AAType, G<AAType, Base, StateType>, StateType>::updateImpl(A);
++    ChangeStatus ChangedF = F<AAType, G<AAType, Base, StateType>, StateType>::updateImpl(A);
+     ChangeStatus ChangedG = G<AAType, Base, StateType>::updateImpl(A);
+     return ChangedF | ChangedG;
+   }
+@@ -728,7 +727,7 @@ struct AAFromMustBeExecutedContext : public Base {
+         A.getInfoCache().getMustBeExecutedContextExplorer();
+ 
+     auto EIt = Explorer.begin(CtxI), EEnd = Explorer.end(CtxI);
+-    for (unsigned u = 0; u < Uses.size(); ++u) {
++    for (unsigned u = 0 ; u < Uses.size(); ++u) {
+       const Use *U = Uses[u];
+       if (const Instruction *UserI = dyn_cast<Instruction>(U->getUser())) {
+         bool Found = Explorer.findInContextOf(UserI, EIt, EEnd);
+@@ -1517,138 +1516,6 @@ struct AANoFreeCallSite final : AANoFreeImpl {
+   void trackStatistics() const override { STATS_DECLTRACK_CS_ATTR(nofree); }
+ };
+ 
+-/// NoFree attribute for floating values.
+-struct AANoFreeFloating : AANoFreeImpl {
+-  AANoFreeFloating(const IRPosition &IRP) : AANoFreeImpl(IRP) {}
+-
+-  /// See AbstractAttribute::trackStatistics()
+-  void trackStatistics() const override{STATS_DECLTRACK_FLOATING_ATTR(nofree)}
+-
+-  /// See Abstract Attribute::updateImpl(...).
+-  ChangeStatus updateImpl(Attributor &A) override {
+-    const IRPosition &IRP = getIRPosition();
+-    Function *F = IRP.getAnchorScope();
+-
+-    const AAIsDead &LivenessAA =
+-        A.getAAFor<AAIsDead>(*this, IRPosition::function(*F));
+-
+-    const auto &NoFreeAA =
+-        A.getAAFor<AANoFree>(*this, IRPosition::function_scope(IRP));
+-    if (NoFreeAA.isAssumedNoFree())
+-      return ChangeStatus::UNCHANGED;
+-
+-    SmallPtrSet<const Use *, 8> Visited;
+-    SmallVector<const Use *, 8> Worklist;
+-
+-    Value &AssociatedValue = getIRPosition().getAssociatedValue();
+-    for (Use &U : AssociatedValue.uses())
+-      Worklist.push_back(&U);
+-
+-    while (!Worklist.empty()) {
+-      const Use *U = Worklist.pop_back_val();
+-      if (!Visited.insert(U).second)
+-        continue;
+-
+-      auto *UserI = U->getUser();
+-      if (!UserI)
+-        continue;
+-
+-      if (LivenessAA.isAssumedDead(cast<Instruction>(UserI)))
+-        continue;
+-
+-      if (auto *CB = dyn_cast<CallBase>(UserI)) {
+-        if (CB->isBundleOperand(U))
+-          return indicatePessimisticFixpoint();
+-        if (!CB->isArgOperand(U))
+-          continue;
+-
+-        unsigned ArgNo = U - CB->arg_begin();
+-
+-        const auto &NoFreeArg = A.getAAFor<AANoFree>(
+-            *this, IRPosition::callsite_argument(*CB, ArgNo));
+-
+-        if (NoFreeArg.isAssumedNoFree())
+-          continue;
+-
+-        return indicatePessimisticFixpoint();
+-      }
+-
+-      if (isa<GetElementPtrInst>(UserI) || isa<BitCastInst>(UserI) ||
+-          isa<PHINode>(UserI) || isa<SelectInst>(UserI)) {
+-        for (Use &U : UserI->uses())
+-          Worklist.push_back(&U);
+-        continue;
+-      }
+-
+-      // Unknown user.
+-      return indicatePessimisticFixpoint();
+-    }
+-    return ChangeStatus::UNCHANGED;
+-  }
+-};
+-
+-/// NoFree attribute for a call site argument.
+-struct AANoFreeArgument final : AANoFreeFloating {
+-  AANoFreeArgument(const IRPosition &IRP) : AANoFreeFloating(IRP) {}
+-
+-  /// See AbstractAttribute::trackStatistics()
+-  void trackStatistics() const override { STATS_DECLTRACK_ARG_ATTR(nofree) }
+-};
+-
+-/// NoFree attribute for call site arguments.
+-struct AANoFreeCallSiteArgument final : AANoFreeFloating {
+-  AANoFreeCallSiteArgument(const IRPosition &IRP) : AANoFreeFloating(IRP) {}
+-
+-  /// See AbstractAttribute::updateImpl(...).
+-  ChangeStatus updateImpl(Attributor &A) override {
+-    // TODO: Once we have call site specific value information we can provide
+-    //       call site specific liveness information and then it makes
+-    //       sense to specialize attributes for call sites arguments instead of
+-    //       redirecting requests to the callee argument.
+-    Argument *Arg = getAssociatedArgument();
+-    if (!Arg)
+-      return indicatePessimisticFixpoint();
+-    const IRPosition &ArgPos = IRPosition::argument(*Arg);
+-    auto &ArgAA = A.getAAFor<AANoFree>(*this, ArgPos);
+-    return clampStateAndIndicateChange(
+-        getState(), static_cast<const AANoFree::StateType &>(ArgAA.getState()));
+-  }
+-
+-  /// See AbstractAttribute::trackStatistics()
+-  void trackStatistics() const override{STATS_DECLTRACK_CSARG_ATTR(nofree)};
+-};
+-
+-/// NoFree attribute for function return value.
+-struct AANoFreeReturned final : AANoFreeFloating {
+-  AANoFreeReturned(const IRPosition &IRP) : AANoFreeFloating(IRP) {
+-    llvm_unreachable("NoFree is not applicable to function returns!");
+-  }
+-
+-  /// See AbstractAttribute::initialize(...).
+-  void initialize(Attributor &A) override {
+-    llvm_unreachable("NoFree is not applicable to function returns!");
+-  }
+-
+-  /// See AbstractAttribute::updateImpl(...).
+-  ChangeStatus updateImpl(Attributor &A) override {
+-    llvm_unreachable("NoFree is not applicable to function returns!");
+-  }
+-
+-  /// See AbstractAttribute::trackStatistics()
+-  void trackStatistics() const override {}
+-};
+-
+-/// NoFree attribute deduction for a call site return value.
+-struct AANoFreeCallSiteReturned final : AANoFreeFloating {
+-  AANoFreeCallSiteReturned(const IRPosition &IRP) : AANoFreeFloating(IRP) {}
+-
+-  ChangeStatus manifest(Attributor &A) override {
+-    return ChangeStatus::UNCHANGED;
+-  }
+-  /// See AbstractAttribute::trackStatistics()
+-  void trackStatistics() const override { STATS_DECLTRACK_CSRET_ATTR(nofree) }
+-};
+-
+ /// ------------------------ NonNull Argument Attribute ------------------------
+ static int64_t getKnownNonNullAndDerefBytesForUse(
+     Attributor &A, AbstractAttribute &QueryingAA, Value &AssociatedValue,
+@@ -1771,8 +1638,7 @@ struct AANonNullFloating
+       return Change;
+ 
+     if (!NullIsDefined) {
+-      const auto &DerefAA =
+-          A.getAAFor<AADereferenceable>(*this, getIRPosition());
++      const auto &DerefAA = A.getAAFor<AADereferenceable>(*this, getIRPosition());
+       if (DerefAA.getAssumedDereferenceableBytes())
+         return Change;
+     }
+@@ -2707,7 +2573,7 @@ identifyAliveSuccessors(Attributor &A, const SwitchInst &SI,
+                         AbstractAttribute &AA,
+                         SmallVectorImpl<const Instruction *> &AliveSuccessors) {
+   bool UsedAssumedInformation = false;
+-  Optional<ConstantInt *> CI = getAssumedConstant(A, *SI.getCondition(), AA);
++    Optional<ConstantInt *> CI = getAssumedConstant(A, *SI.getCondition(), AA);
+   if (!CI.hasValue()) {
+     // No value yet, assume all edges are dead.
+   } else if (CI.getValue()) {
+@@ -3357,7 +3223,7 @@ struct AANoCaptureImpl : public AANoCapture {
+     // Check existing "returned" attributes.
+     int ArgNo = IRP.getArgNo();
+     if (F.doesNotThrow() && ArgNo >= 0) {
+-      for (unsigned u = 0, e = F.arg_size(); u < e; ++u)
++      for (unsigned u = 0, e = F.arg_size(); u< e; ++u)
+         if (F.hasParamAttribute(u, Attribute::Returned)) {
+           if (u == unsigned(ArgNo))
+             State.removeAssumedBits(NOT_CAPTURED_IN_RET);
+@@ -4132,7 +3998,7 @@ ChangeStatus AAHeapToStackImpl::updateImpl(Attributor &A) {
+       if (auto *Num = dyn_cast<ConstantInt>(I.getOperand(0)))
+         if (auto *Size = dyn_cast<ConstantInt>(I.getOperand(1)))
+           if ((Size->getValue().umul_ov(Num->getValue(), Overflow))
+-                  .sle(MaxHeapToStackSize))
++                   .sle(MaxHeapToStackSize))
+             if (!Overflow && (UsesCheck(I) || FreeCheck(I))) {
+               MallocCalls.insert(&I);
+               return true;
+@@ -4323,6 +4189,7 @@ struct AAMemoryBehaviorArgument : AAMemoryBehaviorFloating {
+     return AAMemoryBehaviorFloating::manifest(A);
+   }
+ 
++
+   /// See AbstractAttribute::trackStatistics()
+   void trackStatistics() const override {
+     if (isAssumedReadNone())
+@@ -4732,7 +4599,8 @@ bool Attributor::checkForAllCallSites(
+   for (const Use &U : Fn.uses()) {
+     AbstractCallSite ACS(&U);
+     if (!ACS) {
+-      LLVM_DEBUG(dbgs() << "[Attributor] Function " << Fn.getName()
++      LLVM_DEBUG(dbgs() << "[Attributor] Function "
++                        << Fn.getName()
+                         << " has non call site use " << *U.get() << " in "
+                         << *U.getUser() << "\n");
+       return false;
+@@ -4743,7 +4611,7 @@ bool Attributor::checkForAllCallSites(
+ 
+     const auto *LivenessAA =
+         lookupAAFor<AAIsDead>(IRPosition::function(*Caller), QueryingAA,
+-                              /* TrackDependence */ false);
++                           /* TrackDependence */ false);
+ 
+     // Skip dead calls.
+     if (LivenessAA && LivenessAA->isAssumedDead(I)) {
+@@ -4760,7 +4628,8 @@ bool Attributor::checkForAllCallSites(
+       if (!RequireAllCallSites)
+         continue;
+       LLVM_DEBUG(dbgs() << "[Attributor] User " << EffectiveUse->getUser()
+-                        << " is an invalid use of " << Fn.getName() << "\n");
++                        << " is an invalid use of "
++                        << Fn.getName() << "\n");
+       return false;
+     }
+ 
+@@ -5079,8 +4948,7 @@ ChangeStatus Attributor::run(Module &M) {
+                         << " instead of " << *OldV << "\n");
+       U->set(NewV);
+       if (Instruction *I = dyn_cast<Instruction>(OldV))
+-        if (!isa<PHINode>(I) && !ToBeDeletedInsts.count(I) &&
+-            isInstructionTriviallyDead(I)) {
++        if (!isa<PHINode>(I) && !ToBeDeletedInsts.count(I) && isInstructionTriviallyDead(I)) {
+           DeadInsts.push_back(I);
+         }
+       if (isa<Constant>(NewV) && isa<BranchInst>(U->getUser())) {
+@@ -5313,9 +5181,6 @@ void Attributor::identifyDefaultAbstractAttributes(Function &F) {
+       // Every argument with pointer type might be marked
+       // "readnone/readonly/writeonly/..."
+       getOrCreateAAFor<AAMemoryBehavior>(ArgPos);
+-
+-      // Every argument with pointer type might be marked nofree.
+-      getOrCreateAAFor<AANoFree>(ArgPos);
+     }
+   }
+ 
+@@ -5353,9 +5218,6 @@ void Attributor::identifyDefaultAbstractAttributes(Function &F) {
+ 
+         // Call site argument attribute "align".
+         getOrCreateAAFor<AAAlign>(CSArgPos);
+-
+-	// Call site argument attribute "nofree".
+-	getOrCreateAAFor<AANoFree>(CSArgPos);
+       }
+     }
+     return true;
+@@ -5636,6 +5498,7 @@ const char AAMemoryBehavior::ID = 0;
+ 
+ CREATE_FUNCTION_ABSTRACT_ATTRIBUTE_FOR_POSITION(AANoUnwind)
+ CREATE_FUNCTION_ABSTRACT_ATTRIBUTE_FOR_POSITION(AANoSync)
++CREATE_FUNCTION_ABSTRACT_ATTRIBUTE_FOR_POSITION(AANoFree)
+ CREATE_FUNCTION_ABSTRACT_ATTRIBUTE_FOR_POSITION(AANoRecurse)
+ CREATE_FUNCTION_ABSTRACT_ATTRIBUTE_FOR_POSITION(AAWillReturn)
+ CREATE_FUNCTION_ABSTRACT_ATTRIBUTE_FOR_POSITION(AANoReturn)
+@@ -5649,7 +5512,6 @@ CREATE_VALUE_ABSTRACT_ATTRIBUTE_FOR_POSITION(AANoCapture)
+ 
+ CREATE_ALL_ABSTRACT_ATTRIBUTE_FOR_POSITION(AAValueSimplify)
+ CREATE_ALL_ABSTRACT_ATTRIBUTE_FOR_POSITION(AAIsDead)
+-CREATE_ALL_ABSTRACT_ATTRIBUTE_FOR_POSITION(AANoFree)
+ 
+ CREATE_FUNCTION_ONLY_ABSTRACT_ATTRIBUTE_FOR_POSITION(AAHeapToStack)
+ 
+diff --git a/llvm/test/Transforms/FunctionAttrs/align.ll b/llvm/test/Transforms/FunctionAttrs/align.ll
+index 73d5b24bb05..aa1197c7931 100644
+--- a/llvm/test/Transforms/FunctionAttrs/align.ll
++++ b/llvm/test/Transforms/FunctionAttrs/align.ll
+@@ -8,26 +8,26 @@ target datalayout = "e-m:e-i64:64-f80:128-n8:16:32:64-S128"
+ 
+ 
+ ; TEST 1
+-; ATTRIBUTOR: define align 8 i32* @test1(i32* nofree readnone returned align 8 "no-capture-maybe-returned" %0)
++; ATTRIBUTOR: define align 8 i32* @test1(i32* readnone returned align 8 "no-capture-maybe-returned" %0)
+ define i32* @test1(i32* align 8 %0) #0 {
+   ret i32* %0
+ }
+ 
+ ; TEST 2
+-; ATTRIBUTOR: define i32* @test2(i32* nofree readnone returned "no-capture-maybe-returned" %0)
++; ATTRIBUTOR: define i32* @test2(i32* readnone returned "no-capture-maybe-returned" %0)
+ define i32* @test2(i32* %0) #0 {
+   ret i32* %0
+ }
+ 
+ ; TEST 3
+-; ATTRIBUTOR: define align 4 i32* @test3(i32* nofree readnone align 8 "no-capture-maybe-returned" %0, i32* nofree readnone align 4 "no-capture-maybe-returned" %1, i1 %2)
++; ATTRIBUTOR: define align 4 i32* @test3(i32* readnone align 8 "no-capture-maybe-returned" %0, i32* readnone align 4 "no-capture-maybe-returned" %1, i1 %2)
+ define i32* @test3(i32* align 8 %0, i32* align 4 %1, i1 %2) #0 {
+   %ret = select i1 %2, i32* %0, i32* %1
+   ret i32* %ret
+ }
+ 
+ ; TEST 4
+-; ATTRIBUTOR: define align 32 i32* @test4(i32* nofree readnone align 32 "no-capture-maybe-returned" %0, i32* nofree readnone align 32 "no-capture-maybe-returned" %1, i1 %2)
++; ATTRIBUTOR: define align 32 i32* @test4(i32* readnone align 32 "no-capture-maybe-returned" %0, i32* readnone align 32 "no-capture-maybe-returned" %1, i1 %2)
+ define i32* @test4(i32* align 32 %0, i32* align 32 %1, i1 %2) #0 {
+   %ret = select i1 %2, i32* %0, i32* %1
+   ret i32* %ret
+@@ -134,7 +134,7 @@ define internal i8* @f3(i8* readnone %0) local_unnamed_addr #0 {
+ ; Better than IR information
+ define align 4 i32* @test7(i32* align 32 %p) #0 {
+ ; ATTRIBUTOR-LABEL: define {{[^@]+}}@test7
+-; ATTRIBUTOR-SAME: (i32* nofree readnone returned align 32 "no-capture-maybe-returned" [[P:%.*]])
++; ATTRIBUTOR-SAME: (i32* readnone returned align 32 "no-capture-maybe-returned" [[P:%.*]])
+ ; ATTRIBUTOR-NEXT:    ret i32* [[P:%.*]]
+ ;
+   tail call i8* @f1(i8* align 8 dereferenceable(1) @a1)
+@@ -146,11 +146,11 @@ define align 4 i32* @test7(i32* align 32 %p) #0 {
+ define internal i8* @f1b(i8* readnone %0) local_unnamed_addr #0 {
+ ;
+ ; ATTRIBUTOR-LABEL: define {{[^@]+}}@f1b
+-; ATTRIBUTOR-SAME: (i8* nofree nonnull readnone align 8 dereferenceable(1) "no-capture-maybe-returned" [[TMP0:%.*]]) local_unnamed_addr
++; ATTRIBUTOR-SAME: (i8* nonnull readnone align 8 dereferenceable(1) "no-capture-maybe-returned" [[TMP0:%.*]]) local_unnamed_addr
+ ; ATTRIBUTOR-NEXT:    [[TMP2:%.*]] = icmp eq i8* [[TMP0:%.*]], null
+ ; ATTRIBUTOR-NEXT:    br i1 [[TMP2]], label [[TMP3:%.*]], label [[TMP5:%.*]]
+ ; ATTRIBUTOR:       3:
+-; ATTRIBUTOR-NEXT:    [[TMP4:%.*]] = tail call align 8 i8* @f2b(i8* nofree nonnull align 8 dereferenceable(1) @a1)
++; ATTRIBUTOR-NEXT:    [[TMP4:%.*]] = tail call align 8 i8* @f2b(i8* nonnull align 8 dereferenceable(1) @a1)
+ ; ATTRIBUTOR-NEXT:    [[L:%.*]] = load i8, i8* [[TMP4]], align 8
+ ; ATTRIBUTOR-NEXT:    store i8 [[L]], i8* @a1, align 8
+ ; ATTRIBUTOR-NEXT:    br label [[TMP5]]
+@@ -176,14 +176,14 @@ define internal i8* @f1b(i8* readnone %0) local_unnamed_addr #0 {
+ define internal i8* @f2b(i8* readnone %0) local_unnamed_addr #0 {
+ ;
+ ; ATTRIBUTOR-LABEL: define {{[^@]+}}@f2b
+-; ATTRIBUTOR-SAME: (i8* nofree nonnull readnone align 8 dereferenceable(1) "no-capture-maybe-returned" [[TMP0:%.*]]) local_unnamed_addr
++; ATTRIBUTOR-SAME: (i8* nonnull readnone align 8 dereferenceable(1) "no-capture-maybe-returned" [[TMP0:%.*]]) local_unnamed_addr
+ ; ATTRIBUTOR-NEXT:    [[TMP2:%.*]] = icmp eq i8* @a1, null
+ ; ATTRIBUTOR-NEXT:    br i1 [[TMP2]], label [[TMP5:%.*]], label [[TMP3:%.*]]
+ ; ATTRIBUTOR:       3:
+-; ATTRIBUTOR-NEXT:    [[TMP4:%.*]] = tail call i8* @f1b(i8* nofree nonnull align 8 dereferenceable(1) "no-capture-maybe-returned" @a1)
++; ATTRIBUTOR-NEXT:    [[TMP4:%.*]] = tail call i8* @f1b(i8* nonnull align 8 dereferenceable(1) "no-capture-maybe-returned" @a1)
+ ; ATTRIBUTOR-NEXT:    br label [[TMP7:%.*]]
+ ; ATTRIBUTOR:       5:
+-; ATTRIBUTOR-NEXT:    [[TMP6:%.*]] = tail call i8* @f3b(i8* nofree nonnull align 16 dereferenceable(1) @a2)
++; ATTRIBUTOR-NEXT:    [[TMP6:%.*]] = tail call i8* @f3b(i8* nonnull align 16 dereferenceable(1) @a2)
+ ; ATTRIBUTOR-NEXT:    br label [[TMP7]]
+ ; ATTRIBUTOR:       7:
+ ; ATTRIBUTOR-NEXT:    [[TMP8:%.*]] = phi i8* [ [[TMP4]], [[TMP3]] ], [ [[TMP6]], [[TMP5]] ]
+@@ -210,11 +210,11 @@ define internal i8* @f2b(i8* readnone %0) local_unnamed_addr #0 {
+ define internal i8* @f3b(i8* readnone %0) local_unnamed_addr #0 {
+ ;
+ ; ATTRIBUTOR-LABEL: define {{[^@]+}}@f3b
+-; ATTRIBUTOR-SAME: (i8* nocapture nofree nonnull readnone align 16 dereferenceable(1) [[TMP0:%.*]]) local_unnamed_addr
++; ATTRIBUTOR-SAME: (i8* nocapture nonnull readnone align 16 dereferenceable(1) [[TMP0:%.*]]) local_unnamed_addr
+ ; ATTRIBUTOR-NEXT:    [[TMP2:%.*]] = icmp eq i8* @a2, null
+ ; ATTRIBUTOR-NEXT:    br i1 [[TMP2]], label [[TMP3:%.*]], label [[TMP5:%.*]]
+ ; ATTRIBUTOR:       3:
+-; ATTRIBUTOR-NEXT:    [[TMP4:%.*]] = tail call i8* @f1b(i8* nofree nonnull align 16 dereferenceable(1) @a2)
++; ATTRIBUTOR-NEXT:    [[TMP4:%.*]] = tail call i8* @f1b(i8* nonnull align 16 dereferenceable(1) @a2)
+ ; ATTRIBUTOR-NEXT:    br label [[TMP5]]
+ ; ATTRIBUTOR:       5:
+ ; ATTRIBUTOR-NEXT:    [[TMP6:%.*]] = phi i8* [ [[TMP4]], [[TMP3]] ], [ @a1, [[TMP1:%.*]] ]
+@@ -234,8 +234,8 @@ define internal i8* @f3b(i8* readnone %0) local_unnamed_addr #0 {
+ 
+ define align 4 i32* @test7b(i32* align 32 %p) #0 {
+ ; ATTRIBUTOR-LABEL: define {{[^@]+}}@test7b
+-; ATTRIBUTOR-SAME: (i32* nofree readnone returned align 32 "no-capture-maybe-returned" [[P:%.*]])
+-; ATTRIBUTOR-NEXT:    [[TMP1:%.*]] = tail call i8* @f1b(i8* nofree nonnull align 8 dereferenceable(1) @a1)
++; ATTRIBUTOR-SAME: (i32* readnone returned align 32 "no-capture-maybe-returned" [[P:%.*]])
++; ATTRIBUTOR-NEXT:    [[TMP1:%.*]] = tail call i8* @f1b(i8* nonnull align 8 dereferenceable(1) @a1)
+ ; ATTRIBUTOR-NEXT:    ret i32* [[P:%.*]]
+ ;
+   tail call i8* @f1b(i8* align 8 dereferenceable(1) @a1)
+@@ -276,7 +276,7 @@ define void @test9_traversal(i1 %c, i32* align 4 %B, i32* align 8 %C) {
+ 
+ ; FIXME: This will work with an upcoming patch (D66618 or similar)
+ ;             define align 32 i32* @test10a(i32* align 32 "no-capture-maybe-returned" %p)
+-; ATTRIBUTOR: define i32* @test10a(i32* nofree nonnull align 32 dereferenceable(4) "no-capture-maybe-returned" %p)
++; ATTRIBUTOR: define i32* @test10a(i32* nonnull align 32 dereferenceable(4) "no-capture-maybe-returned" %p)
+ define i32* @test10a(i32* align 32 %p) {
+ ; ATTRIBUTOR: %l = load i32, i32* %p, align 32
+   %l = load i32, i32* %p
+@@ -304,7 +304,7 @@ e:
+ 
+ ; FIXME: This will work with an upcoming patch (D66618 or similar)
+ ;             define align 32 i32* @test10b(i32* align 32 "no-capture-maybe-returned" %p)
+-; ATTRIBUTOR: define i32* @test10b(i32* nofree nonnull align 32 dereferenceable(4) "no-capture-maybe-returned" %p)
++; ATTRIBUTOR: define i32* @test10b(i32* nonnull align 32 dereferenceable(4) "no-capture-maybe-returned" %p)
+ define i32* @test10b(i32* align 32 %p) {
+ ; ATTRIBUTOR: %l = load i32, i32* %p, align 32
+   %l = load i32, i32* %p
+diff --git a/llvm/test/Transforms/FunctionAttrs/arg_nocapture.ll b/llvm/test/Transforms/FunctionAttrs/arg_nocapture.ll
+index b7dc0073d95..18a4f767147 100644
+--- a/llvm/test/Transforms/FunctionAttrs/arg_nocapture.ll
++++ b/llvm/test/Transforms/FunctionAttrs/arg_nocapture.ll
+@@ -12,7 +12,7 @@ target datalayout = "e-m:e-i64:64-f80:128-n8:16:32:64-S128"
+ ; }
+ ;
+ ; FIXME: no-capture missing for %p
+-; CHECK: define i32 @is_null_return(i32* nofree readnone %p)
++; CHECK: define i32 @is_null_return(i32* readnone %p)
+ define i32 @is_null_return(i32* %p) #0 {
+ entry:
+   %cmp = icmp eq i32* %p, null
+@@ -31,7 +31,7 @@ entry:
+ ; }
+ ;
+ ; FIXME: no-capture missing for %p
+-; CHECK: define i32 @is_null_control(i32* nofree readnone %p)
++; CHECK: define i32 @is_null_control(i32* readnone %p)
+ define i32 @is_null_control(i32* %p) #0 {
+ entry:
+   %retval = alloca i32, align 4
+@@ -66,7 +66,7 @@ return:                                           ; preds = %if.end3, %if.then2,
+ ;   return 0;
+ ; }
+ ;
+-; CHECK: define noalias nonnull align 536870912 dereferenceable(4294967295) double* @srec0(double* nocapture nofree readnone %a)
++; CHECK: define noalias nonnull align 536870912 dereferenceable(4294967295) double* @srec0(double* nocapture readnone %a)
+ define double* @srec0(double* %a) #0 {
+ entry:
+   %call = call double* @srec0(double* %a)
+@@ -86,7 +86,7 @@ entry:
+ ;
+ ; Other arguments are possible here due to the no-return behavior.
+ ;
+-; CHECK: define noalias nonnull align 536870912 dereferenceable(4294967295) i32* @srec16(i32* nocapture nofree readnone %a)
++; CHECK: define noalias nonnull align 536870912 dereferenceable(4294967295) i32* @srec16(i32* nocapture readnone %a)
+ define i32* @srec16(i32* %a) #0 {
+ entry:
+   %call = call i32* @srec16(i32* %a)
+@@ -112,11 +112,11 @@ entry:
+ 
+ ; TEST SCC with various calls, casts, and comparisons agains NULL
+ ;
+-; CHECK: define dereferenceable_or_null(4) float* @scc_A(i32* nofree readnone returned dereferenceable_or_null(4) "no-capture-maybe-returned" %a)
++; CHECK: define dereferenceable_or_null(4) float* @scc_A(i32* readnone returned dereferenceable_or_null(4) "no-capture-maybe-returned" %a)
+ ;
+-; CHECK: define dereferenceable_or_null(8) i64* @scc_B(double* nofree readnone returned dereferenceable_or_null(8) "no-capture-maybe-returned" %a)
++; CHECK: define dereferenceable_or_null(8) i64* @scc_B(double* readnone returned dereferenceable_or_null(8) "no-capture-maybe-returned" %a)
+ ;
+-; CHECK: define dereferenceable_or_null(4) i8* @scc_C(i16* nofree readnone returned dereferenceable_or_null(4) "no-capture-maybe-returned" %a)
++; CHECK: define dereferenceable_or_null(4) i8* @scc_C(i16* readnone returned dereferenceable_or_null(4) "no-capture-maybe-returned" %a)
+ ;
+ ; float *scc_A(int *a) {
+ ;   return (float*)(a ? (int*)scc_A((int*)scc_B((double*)scc_C((short*)a))) : a);
+@@ -244,7 +244,7 @@ declare i32 @printf(i8* nocapture, ...)
+ ; }
+ ;
+ ; There should *not* be a no-capture attribute on %a
+-; CHECK: define nonnull dereferenceable(8) i64* @not_captured_but_returned_0(i64* nofree nonnull returned writeonly dereferenceable(8) "no-capture-maybe-returned" %a)
++; CHECK: define nonnull dereferenceable(8) i64* @not_captured_but_returned_0(i64* nonnull returned writeonly dereferenceable(8) "no-capture-maybe-returned" %a)
+ 
+ define i64* @not_captured_but_returned_0(i64* %a) #0 {
+ entry:
+@@ -260,7 +260,7 @@ entry:
+ ; }
+ ;
+ ; There should *not* be a no-capture attribute on %a
+-; CHECK: define nonnull dereferenceable(8) i64* @not_captured_but_returned_1(i64* nofree nonnull writeonly dereferenceable(16) "no-capture-maybe-returned" %a)
++; CHECK: define nonnull dereferenceable(8) i64* @not_captured_but_returned_1(i64* nonnull writeonly dereferenceable(16) "no-capture-maybe-returned" %a)
+ define i64* @not_captured_but_returned_1(i64* %a) #0 {
+ entry:
+   %add.ptr = getelementptr inbounds i64, i64* %a, i64 1
+@@ -275,7 +275,7 @@ entry:
+ ;   not_captured_but_returned_1(a);
+ ; }
+ ;
+-; CHECK: define void @test_not_captured_but_returned_calls(i64* nocapture nofree writeonly %a)
++; CHECK: define void @test_not_captured_but_returned_calls(i64* nocapture writeonly %a)
+ define void @test_not_captured_but_returned_calls(i64* %a) #0 {
+ entry:
+   %call = call i64* @not_captured_but_returned_0(i64* %a)
+@@ -290,7 +290,7 @@ entry:
+ ; }
+ ;
+ ; There should *not* be a no-capture attribute on %a
+-; CHECK: define i64* @negative_test_not_captured_but_returned_call_0a(i64* nofree returned writeonly "no-capture-maybe-returned" %a)
++; CHECK: define i64* @negative_test_not_captured_but_returned_call_0a(i64* returned writeonly "no-capture-maybe-returned" %a)
+ define i64* @negative_test_not_captured_but_returned_call_0a(i64* %a) #0 {
+ entry:
+   %call = call i64* @not_captured_but_returned_0(i64* %a)
+@@ -304,7 +304,7 @@ entry:
+ ; }
+ ;
+ ; There should *not* be a no-capture attribute on %a
+-; CHECK: define void @negative_test_not_captured_but_returned_call_0b(i64* nofree writeonly %a)
++; CHECK: define void @negative_test_not_captured_but_returned_call_0b(i64* writeonly %a)
+ define void @negative_test_not_captured_but_returned_call_0b(i64* %a) #0 {
+ entry:
+   %call = call i64* @not_captured_but_returned_0(i64* %a)
+@@ -320,7 +320,7 @@ entry:
+ ; }
+ ;
+ ; There should *not* be a no-capture attribute on %a
+-; CHECK: define nonnull dereferenceable(8) i64* @negative_test_not_captured_but_returned_call_1a(i64* nofree writeonly "no-capture-maybe-returned" %a)
++; CHECK: define nonnull dereferenceable(8) i64* @negative_test_not_captured_but_returned_call_1a(i64* writeonly "no-capture-maybe-returned" %a)
+ define i64* @negative_test_not_captured_but_returned_call_1a(i64* %a) #0 {
+ entry:
+   %call = call i64* @not_captured_but_returned_1(i64* %a)
+@@ -334,7 +334,7 @@ entry:
+ ; }
+ ;
+ ; There should *not* be a no-capture attribute on %a
+-; CHECK: define void @negative_test_not_captured_but_returned_call_1b(i64* nofree writeonly %a)
++; CHECK: define void @negative_test_not_captured_but_returned_call_1b(i64* writeonly %a)
+ define void @negative_test_not_captured_but_returned_call_1b(i64* %a) #0 {
+ entry:
+   %call = call i64* @not_captured_but_returned_1(i64* %a)
+diff --git a/llvm/test/Transforms/FunctionAttrs/arg_returned.ll b/llvm/test/Transforms/FunctionAttrs/arg_returned.ll
+index aa3e508b35f..514438eaa24 100644
+--- a/llvm/test/Transforms/FunctionAttrs/arg_returned.ll
++++ b/llvm/test/Transforms/FunctionAttrs/arg_returned.ll
+@@ -164,11 +164,11 @@ return:                                           ; preds = %cond.end, %if.then3
+ ; FNATTR: define double* @ptr_scc_r2(double* readnone %a, double* readnone %b, double* readnone %r)
+ ;
+ ; ATTRIBUTOR: Function Attrs: nofree noinline nosync nounwind readnone uwtable
+-; ATTRIBUTOR-NEXT: define double* @ptr_sink_r0(double* nofree readnone returned "no-capture-maybe-returned" %r)
++; ATTRIBUTOR-NEXT: define double* @ptr_sink_r0(double* readnone returned "no-capture-maybe-returned" %r)
+ ; ATTRIBUTOR: Function Attrs: nofree noinline nosync nounwind readnone uwtable
+-; ATTRIBUTOR-NEXT: define double* @ptr_scc_r1(double* nofree readnone %a, double* nofree readnone returned %r, double* nocapture nofree readnone %b)
++; ATTRIBUTOR-NEXT: define double* @ptr_scc_r1(double* readnone %a, double* readnone returned %r, double* nocapture readnone %b)
+ ; ATTRIBUTOR: Function Attrs: nofree noinline nosync nounwind readnone uwtable
+-; ATTRIBUTOR-NEXT: define double* @ptr_scc_r2(double* nofree readnone %a, double* nofree readnone %b, double* nofree readnone returned %r)
++; ATTRIBUTOR-NEXT: define double* @ptr_scc_r2(double* readnone %a, double* readnone %b, double* readnone returned %r)
+ ;
+ ; double* ptr_scc_r1(double* a, double* b, double* r);
+ ; double* ptr_scc_r2(double* a, double* b, double* r);
+@@ -254,7 +254,7 @@ return:                                           ; preds = %cond.end, %if.then3
+ ;
+ ; FNATTR:  define i32* @rt0(i32* readonly %a)
+ ; BOTH:      Function Attrs: nofree noinline norecurse noreturn nosync nounwind readonly uwtable
+-; BOTH-NEXT: define noalias nonnull align 536870912 dereferenceable(4294967295) i32* @rt0(i32* nocapture nofree nonnull readonly dereferenceable(4) %a)
++; BOTH-NEXT: define noalias nonnull align 536870912 dereferenceable(4294967295) i32* @rt0(i32* nocapture nonnull readonly dereferenceable(4) %a)
+ define i32* @rt0(i32* %a) #0 {
+ entry:
+   %v = load i32, i32* %a, align 4
+@@ -272,7 +272,7 @@ entry:
+ ;
+ ; FNATTR:  define noalias i32* @rt1(i32* nocapture readonly %a)
+ ; BOTH: Function Attrs: nofree noinline norecurse noreturn nosync nounwind readonly uwtable
+-; BOTH-NEXT:    define noalias nonnull align 536870912 dereferenceable(4294967295) i32* @rt1(i32* nocapture nofree nonnull readonly dereferenceable(4) %a)
++; BOTH-NEXT:    define noalias nonnull align 536870912 dereferenceable(4294967295) i32* @rt1(i32* nocapture nonnull readonly dereferenceable(4) %a)
+ define i32* @rt1(i32* %a) #0 {
+ entry:
+   %v = load i32, i32* %a, align 4
+@@ -286,8 +286,8 @@ entry:
+ ;
+ ; FNATTR:  define i32* @rt2_helper(i32* %a)
+ ; FNATTR:  define i32* @rt2(i32* readnone %a, i32* readnone %b)
+-; BOTH:    define i32* @rt2_helper(i32* nofree readnone returned %a)
+-; BOTH:    define i32* @rt2(i32* nofree readnone %a, i32* nofree readnone "no-capture-maybe-returned" %b)
++; BOTH:    define i32* @rt2_helper(i32* readnone returned %a)
++; BOTH:    define i32* @rt2(i32* readnone %a, i32* readnone "no-capture-maybe-returned" %b)
+ define i32* @rt2_helper(i32* %a) #0 {
+ entry:
+   %call = call i32* @rt2(i32* %a, i32* %a)
+@@ -312,8 +312,8 @@ if.end:
+ ;
+ ; FNATTR:  define i32* @rt3_helper(i32* %a, i32* %b)
+ ; FNATTR:  define i32* @rt3(i32* readnone %a, i32* readnone %b)
+-; BOTH:    define i32* @rt3_helper(i32* nofree readnone %a, i32* nofree readnone returned "no-capture-maybe-returned" %b)
+-; BOTH:    define i32* @rt3(i32* nofree readnone %a, i32* nofree readnone returned "no-capture-maybe-returned" %b)
++; BOTH:    define i32* @rt3_helper(i32* readnone %a, i32* readnone returned "no-capture-maybe-returned" %b)
++; BOTH:    define i32* @rt3(i32* readnone %a, i32* readnone returned "no-capture-maybe-returned" %b)
+ define i32* @rt3_helper(i32* %a, i32* %b) #0 {
+ entry:
+   %call = call i32* @rt3(i32* %a, i32* %b)
+@@ -495,12 +495,12 @@ if.end:                                           ; preds = %if.then, %entry
+ ; }
+ ;
+ ; BOTH: Function Attrs: nofree noinline norecurse nosync nounwind readnone uwtable
+-; BOTH-NEXT:  define double* @bitcast(i32* nofree readnone returned "no-capture-maybe-returned" %b)
++; BOTH-NEXT:  define double* @bitcast(i32* readnone returned "no-capture-maybe-returned" %b)
+ ;
+ ; FNATTR:     define double* @bitcast(i32* readnone %b)
+ ;
+ ; ATTRIBUTOR: Function Attrs: nofree noinline nosync nounwind readnone uwtable
+-; ATTRIBUTOR-NEXT: define double* @bitcast(i32* nofree readnone returned "no-capture-maybe-returned" %b)
++; ATTRIBUTOR-NEXT: define double* @bitcast(i32* readnone returned "no-capture-maybe-returned" %b)
+ define double* @bitcast(i32* %b) #0 {
+ entry:
+   %bc0 = bitcast i32* %b to double*
+@@ -518,12 +518,12 @@ entry:
+ ; }
+ ;
+ ; BOTH: Function Attrs: nofree noinline norecurse nosync nounwind readnone uwtable
+-; BOTH-NEXT: define double* @bitcasts_select_and_phi(i32* nofree readnone returned %b)
++; BOTH-NEXT: define double* @bitcasts_select_and_phi(i32* readnone returned %b)
+ ;
+ ; FNATTR:     define double* @bitcasts_select_and_phi(i32* readnone %b)
+ ;
+ ; ATTRIBUTOR: Function Attrs: nofree noinline nosync nounwind readnone uwtable
+-; ATTRIBUTOR-NEXT: define double* @bitcasts_select_and_phi(i32* nofree readnone returned %b)
++; ATTRIBUTOR-NEXT: define double* @bitcasts_select_and_phi(i32* readnone returned %b)
+ define double* @bitcasts_select_and_phi(i32* %b) #0 {
+ entry:
+   %bc0 = bitcast i32* %b to double*
+@@ -556,12 +556,12 @@ if.end:                                           ; preds = %if.then, %entry
+ ; }
+ ;
+ ; BOTH: Function Attrs: nofree noinline norecurse nosync nounwind readnone uwtable
+-; BOTH-NEXT:  define double* @ret_arg_arg_undef(i32* nofree readnone returned %b)
++; BOTH-NEXT:  define double* @ret_arg_arg_undef(i32* readnone returned %b)
+ ;
+ ; FNATTR:     define double* @ret_arg_arg_undef(i32* readnone %b)
+ ;
+ ; ATTRIBUTOR: Function Attrs: nofree noinline nosync nounwind readnone uwtable
+-; ATTRIBUTOR-NEXT: define double* @ret_arg_arg_undef(i32* nofree readnone returned %b)
++; ATTRIBUTOR-NEXT: define double* @ret_arg_arg_undef(i32* readnone returned %b)
+ define double* @ret_arg_arg_undef(i32* %b) #0 {
+ entry:
+   %bc0 = bitcast i32* %b to double*
+@@ -594,12 +594,12 @@ ret_undef:
+ ; }
+ ;
+ ; BOTH: Function Attrs: nofree noinline norecurse nosync nounwind readnone uwtable
+-; BOTH-NEXT:  define double* @ret_undef_arg_arg(i32* nofree readnone returned %b)
++; BOTH-NEXT:  define double* @ret_undef_arg_arg(i32* readnone returned %b)
+ ;
+ ; FNATTR:     define double* @ret_undef_arg_arg(i32* readnone %b)
+ ;
+ ; ATTRIBUTOR: Function Attrs: nofree noinline nosync nounwind readnone uwtable
+-; ATTRIBUTOR-NEXT: define double* @ret_undef_arg_arg(i32* nofree readnone returned %b)
++; ATTRIBUTOR-NEXT: define double* @ret_undef_arg_arg(i32* readnone returned %b)
+ define double* @ret_undef_arg_arg(i32* %b) #0 {
+ entry:
+   %bc0 = bitcast i32* %b to double*
+@@ -632,10 +632,10 @@ ret_arg1:
+ ; }
+ ;
+ ; BOTH: Function Attrs: nofree noinline norecurse nosync nounwind readnone uwtable
+-; BOTH-NEXT:  define double* @ret_undef_arg_undef(i32* nofree readnone returned %b)
++; BOTH-NEXT:  define double* @ret_undef_arg_undef(i32* readnone returned %b)
+ ;
+ ; FNATTR:     define double* @ret_undef_arg_undef(i32* readnone %b)
+-; ATTRIBUTOR: define double* @ret_undef_arg_undef(i32* nofree readnone returned %b)
++; ATTRIBUTOR: define double* @ret_undef_arg_undef(i32* readnone returned %b)
+ define double* @ret_undef_arg_undef(i32* %b) #0 {
+ entry:
+   %bc0 = bitcast i32* %b to double*
+diff --git a/llvm/test/Transforms/FunctionAttrs/dereferenceable.ll b/llvm/test/Transforms/FunctionAttrs/dereferenceable.ll
+index deea7742e6f..973f7f517e6 100644
+--- a/llvm/test/Transforms/FunctionAttrs/dereferenceable.ll
++++ b/llvm/test/Transforms/FunctionAttrs/dereferenceable.ll
+@@ -7,7 +7,7 @@ declare void @deref_phi_user(i32* %a);
+ ; take mininimum of return values
+ ;
+ define i32* @test1(i32* dereferenceable(4) %0, double* dereferenceable(8) %1, i1 zeroext %2) local_unnamed_addr {
+-; ATTRIBUTOR: define nonnull dereferenceable(4) i32* @test1(i32* nofree nonnull readnone dereferenceable(4) "no-capture-maybe-returned" %0, double* nofree nonnull readnone dereferenceable(8) "no-capture-maybe-returned" %1, i1 zeroext %2)
++; ATTRIBUTOR: define nonnull dereferenceable(4) i32* @test1(i32* nonnull readnone dereferenceable(4) "no-capture-maybe-returned" %0, double* nonnull readnone dereferenceable(8) "no-capture-maybe-returned" %1, i1 zeroext %2)
+   %4 = bitcast double* %1 to i32*
+   %5 = select i1 %2, i32* %0, i32* %4
+   ret i32* %5
+@@ -15,7 +15,7 @@ define i32* @test1(i32* dereferenceable(4) %0, double* dereferenceable(8) %1, i1
+ 
+ ; TEST 2
+ define i32* @test2(i32* dereferenceable_or_null(4) %0, double* dereferenceable(8) %1, i1 zeroext %2) local_unnamed_addr {
+-; ATTRIBUTOR: define dereferenceable_or_null(4) i32* @test2(i32* nofree readnone dereferenceable_or_null(4) "no-capture-maybe-returned" %0, double* nofree nonnull readnone dereferenceable(8) "no-capture-maybe-returned" %1, i1 zeroext %2)
++; ATTRIBUTOR: define dereferenceable_or_null(4) i32* @test2(i32* readnone dereferenceable_or_null(4) "no-capture-maybe-returned" %0, double* nonnull readnone dereferenceable(8) "no-capture-maybe-returned" %1, i1 zeroext %2)
+   %4 = bitcast double* %1 to i32*
+   %5 = select i1 %2, i32* %0, i32* %4
+   ret i32* %5
+@@ -24,20 +24,20 @@ define i32* @test2(i32* dereferenceable_or_null(4) %0, double* dereferenceable(8
+ ; TEST 3
+ ; GEP inbounds
+ define i32* @test3_1(i32* dereferenceable(8) %0) local_unnamed_addr {
+-; ATTRIBUTOR: define nonnull dereferenceable(4) i32* @test3_1(i32* nofree nonnull readnone dereferenceable(8) "no-capture-maybe-returned" %0)
++; ATTRIBUTOR: define nonnull dereferenceable(4) i32* @test3_1(i32* nonnull readnone dereferenceable(8) "no-capture-maybe-returned" %0)
+   %ret = getelementptr inbounds i32, i32* %0, i64 1
+   ret i32* %ret
+ }
+ 
+ define i32* @test3_2(i32* dereferenceable_or_null(32) %0) local_unnamed_addr {
+ ; FIXME: We should not have both deref(x) and deref_or_null(y) with x >= y.
+-; ATTRIBUTOR: define nonnull dereferenceable(16) i32* @test3_2(i32* nofree nonnull readnone dereferenceable(32) dereferenceable_or_null(32) "no-capture-maybe-returned" %0)
++; ATTRIBUTOR: define nonnull dereferenceable(16) i32* @test3_2(i32* nonnull readnone dereferenceable(32) dereferenceable_or_null(32) "no-capture-maybe-returned" %0)
+   %ret = getelementptr inbounds i32, i32* %0, i64 4
+   ret i32* %ret
+ }
+ 
+ define i32* @test3_3(i32* dereferenceable(8) %0, i32* dereferenceable(16) %1, i1 %2) local_unnamed_addr {
+-; ATTRIBUTOR: define nonnull dereferenceable(4) i32* @test3_3(i32* nofree nonnull readnone dereferenceable(8) "no-capture-maybe-returned" %0, i32* nofree nonnull readnone dereferenceable(16) "no-capture-maybe-returned" %1, i1 %2) local_unnamed_addr
++; ATTRIBUTOR: define nonnull dereferenceable(4) i32* @test3_3(i32* nonnull readnone dereferenceable(8) "no-capture-maybe-returned" %0, i32* nonnull readnone dereferenceable(16) "no-capture-maybe-returned" %1, i1 %2) local_unnamed_addr
+   %ret1 = getelementptr inbounds i32, i32* %0, i64 1
+   %ret2 = getelementptr inbounds i32, i32* %1, i64 2
+   %ret = select i1 %2, i32* %ret1, i32* %ret2
+@@ -48,7 +48,7 @@ define i32* @test3_3(i32* dereferenceable(8) %0, i32* dereferenceable(16) %1, i1
+ ; Better than known in IR.
+ 
+ define dereferenceable(4) i32* @test4(i32* dereferenceable(8) %0) local_unnamed_addr {
+-; ATTRIBUTOR: define nonnull dereferenceable(8) i32* @test4(i32* nofree nonnull readnone returned dereferenceable(8) "no-capture-maybe-returned" %0)
++; ATTRIBUTOR: define nonnull dereferenceable(8) i32* @test4(i32* nonnull readnone returned dereferenceable(8) "no-capture-maybe-returned" %0)
+   ret i32* %0
+ }
+ 
+@@ -197,7 +197,7 @@ define i32* @f7_3() {
+ 
+ define i32* @test_for_minus_index(i32* %p) {
+ ; FIXME: This should have a return dereferenceable(8) but we need to make sure it will work in loops as well.
+-; ATTRIBUTOR: define nonnull i32* @test_for_minus_index(i32* nofree nonnull writeonly "no-capture-maybe-returned" %p)
++; ATTRIBUTOR: define nonnull i32* @test_for_minus_index(i32* nonnull writeonly "no-capture-maybe-returned" %p)
+   %q = getelementptr inbounds i32, i32* %p, i32 -2
+   store i32 1, i32* %q
+   ret i32* %q
+diff --git a/llvm/test/Transforms/FunctionAttrs/heap_to_stack.ll b/llvm/test/Transforms/FunctionAttrs/heap_to_stack.ll
+index 8a99717343b..04313cf0e77 100644
+--- a/llvm/test/Transforms/FunctionAttrs/heap_to_stack.ll
++++ b/llvm/test/Transforms/FunctionAttrs/heap_to_stack.ll
+@@ -52,7 +52,7 @@ define void @test2() {
+ define void @test3() {
+   %1 = tail call noalias i8* @malloc(i64 4)
+   ; CHECK: %1 = alloca i8, i64 4
+-  ; CHECK-NEXT: @no_sync_func(i8* noalias nocapture nofree %1)
++  ; CHECK-NEXT: @no_sync_func(i8* noalias nocapture %1)
+   tail call void @no_sync_func(i8* %1)
+   ; CHECK-NOT: @free(i8* %1)
+   tail call void @free(i8* %1)
+@@ -66,7 +66,7 @@ define void @test0() {
+   ; CHECK: %1 = alloca i8, i64 8
+   ; CHECK-NEXT: %calloc_bc = bitcast i8* %1 to i8*
+   ; CHECK-NEXT: call void @llvm.memset.p0i8.i64(i8* %calloc_bc, i8 0, i64 8, i1 false)
+-  ; CHECK-NEXT: @no_sync_func(i8* noalias nocapture nofree %1)
++  ; CHECK-NEXT: @no_sync_func(i8* noalias nocapture %1)
+   tail call void @no_sync_func(i8* %1)
+   ; CHECK-NOT: @free(i8* %1)
+   tail call void @free(i8* %1)
+@@ -77,7 +77,7 @@ define void @test0() {
+ define void @test4() {
+   %1 = tail call noalias i8* @malloc(i64 4)
+   ; CHECK: %1 = alloca i8, i64 4
+-  ; CHECK-NEXT: @nofree_func(i8* noalias nocapture nofree %1)
++  ; CHECK-NEXT: @nofree_func(i8* noalias nocapture %1)
+   tail call void @nofree_func(i8* %1)
+   ret void
+ }
+@@ -146,7 +146,7 @@ define void @test7() {
+ define void @test8() {
+   %1 = tail call noalias i8* @malloc(i64 4)
+   ; CHECK: %1 = tail call noalias i8* @malloc(i64 4)
+-  ; CHECK-NEXT: @no_sync_func(i8* nocapture nofree %1)
++  ; CHECK-NEXT: @no_sync_func(i8* nocapture %1)
+   tail call void @no_sync_func(i8* %1)
+   %2 = bitcast i8* %1 to i32*
+   store i32 10, i32* %2
+@@ -161,7 +161,7 @@ define void @test8() {
+ define void @test9() {
+   %1 = tail call noalias i8* @malloc(i64 4)
+   ; CHECK: %1 = tail call noalias i8* @malloc(i64 4)
+-  ; CHECK-NEXT: @no_sync_func(i8* nocapture nofree %1)
++  ; CHECK-NEXT: @no_sync_func(i8* nocapture %1)
+   tail call void @no_sync_func(i8* %1)
+   %2 = bitcast i8* %1 to i32*
+   store i32 10, i32* %2
+@@ -177,7 +177,7 @@ define void @test9() {
+ define i32 @test10() {
+   %1 = tail call noalias i8* @malloc(i64 4)
+   ; CHECK: %1 = alloca i8, i64 4
+-  ; CHECK-NEXT: @no_sync_func(i8* noalias nocapture nofree %1)
++  ; CHECK-NEXT: @no_sync_func(i8* noalias nocapture %1)
+   tail call void @no_sync_func(i8* %1)
+   %2 = bitcast i8* %1 to i32*
+   store i32 10, i32* %2
+@@ -190,7 +190,7 @@ define i32 @test10() {
+ define i32 @test_lifetime() {
+   %1 = tail call noalias i8* @malloc(i64 4)
+   ; CHECK: %1 = alloca i8, i64 4
+-  ; CHECK-NEXT: @no_sync_func(i8* noalias nocapture nofree %1)
++  ; CHECK-NEXT: @no_sync_func(i8* noalias nocapture %1)
+   tail call void @no_sync_func(i8* %1)
+   call void @llvm.lifetime.start.p0i8(i64 4, i8* %1)
+   %2 = bitcast i8* %1 to i32*
+@@ -283,7 +283,7 @@ define i32 @malloc_in_loop(i32 %0) {
+ define i32 @test13() {
+   %1 = tail call noalias i8* @malloc(i64 256)
+   ; CHECK: %1 = tail call noalias i8* @malloc(i64 256)
+-  ; CHECK-NEXT: @no_sync_func(i8* noalias nofree %1)
++  ; CHECK-NEXT: @no_sync_func(i8* noalias %1)
+   tail call void @no_sync_func(i8* %1)
+   %2 = bitcast i8* %1 to i32*
+   store i32 10, i32* %2
+@@ -296,7 +296,7 @@ define i32 @test13() {
+ define void @test14() {
+   %1 = tail call noalias i8* @calloc(i64 64, i64 4)
+   ; CHECK: %1 = tail call noalias i8* @calloc(i64 64, i64 4)
+-  ; CHECK-NEXT: @no_sync_func(i8* noalias nofree %1)
++  ; CHECK-NEXT: @no_sync_func(i8* noalias %1)
+   tail call void @no_sync_func(i8* %1)
+   tail call void @free(i8* %1)
+   ; CHECK: tail call void @free(i8* noalias %1)
+@@ -306,7 +306,7 @@ define void @test14() {
+ define void @test15(i64 %S) {
+   ; CHECK: %1 = tail call noalias i8* @malloc(i64 %S)
+   %1 = tail call noalias i8* @malloc(i64 %S)
+-  ; CHECK-NEXT: @no_sync_func(i8* noalias nofree %1)
++  ; CHECK-NEXT: @no_sync_func(i8* noalias %1)
+   tail call void @no_sync_func(i8* %1)
+   ; CHECK-NEXT: @free(i8* noalias %1)
+   tail call void @free(i8* %1)
+@@ -318,7 +318,7 @@ define void @test16a(i8 %v, i8** %P) {
+   %1 = tail call noalias i8* @malloc(i64 4)
+   ; CHECK-NEXT: store i8 %v, i8* %1
+   store i8 %v, i8* %1
+-  ; CHECK-NEXT: @no_sync_func(i8* noalias nocapture nofree %1)
++  ; CHECK-NEXT: @no_sync_func(i8* noalias nocapture %1)
+   tail call void @no_sync_func(i8* %1)
+   ; CHECK-NOT: @free(i8* %1)
+   tail call void @free(i8* %1)
+@@ -330,7 +330,7 @@ define void @test16b(i8 %v, i8** %P) {
+   %1 = tail call noalias i8* @malloc(i64 4)
+   ; CHECK-NEXT: store i8* %1, i8** %P
+   store i8* %1, i8** %P
+-  ; CHECK-NEXT: @no_sync_func(i8* nocapture nofree %1)
++  ; CHECK-NEXT: @no_sync_func(i8* nocapture %1)
+   tail call void @no_sync_func(i8* %1)
+   ; CHECK-NEXT: @free(i8* %1)
+   tail call void @free(i8* %1)
+@@ -342,7 +342,7 @@ define void @test16c(i8 %v, i8** %P) {
+   %1 = tail call noalias i8* @malloc(i64 4)
+   ; CHECK-NEXT: store i8* %1, i8** %P
+   store i8* %1, i8** %P
+-  ; CHECK-NEXT: @no_sync_func(i8* nocapture nofree %1)
++  ; CHECK-NEXT: @no_sync_func(i8* nocapture %1)
+   tail call void @no_sync_func(i8* %1) nounwind
+   ; CHECK-NOT: @free
+   tail call void @free(i8* %1)
+diff --git a/llvm/test/Transforms/FunctionAttrs/internal-noalias.ll b/llvm/test/Transforms/FunctionAttrs/internal-noalias.ll
+index c83319eb051..9b340442711 100644
+--- a/llvm/test/Transforms/FunctionAttrs/internal-noalias.ll
++++ b/llvm/test/Transforms/FunctionAttrs/internal-noalias.ll
+@@ -8,7 +8,7 @@ entry:
+   ret i32 %add
+ }
+ 
+-; CHECK: define private i32 @noalias_args(i32* nocapture nofree nonnull readonly dereferenceable(4) %A, i32* noalias nocapture nofree nonnull readonly dereferenceable(4) %B)
++; CHECK: define private i32 @noalias_args(i32* nocapture nonnull readonly dereferenceable(4) %A, i32* noalias nocapture nonnull readonly dereferenceable(4) %B)
+ 
+ define private i32 @noalias_args(i32* %A, i32* %B) #0 {
+ entry:
+@@ -23,7 +23,7 @@ entry:
+ 
+ ; FIXME: Should be something like this.
+ ; define internal i32 @noalias_args_argmem(i32* noalias nocapture readonly %A, i32* noalias nocapture readonly %B)
+-; CHECK: define internal i32 @noalias_args_argmem(i32* nocapture nofree nonnull readonly dereferenceable(4) %A, i32* nocapture nofree nonnull readonly dereferenceable(4) %B)
++; CHECK: define internal i32 @noalias_args_argmem(i32* nocapture nonnull readonly dereferenceable(4) %A, i32* nocapture nonnull readonly dereferenceable(4) %B)
+ 
+ ;
+ define internal i32 @noalias_args_argmem(i32* %A, i32* %B) #1 {
+diff --git a/llvm/test/Transforms/FunctionAttrs/liveness.ll b/llvm/test/Transforms/FunctionAttrs/liveness.ll
+index 9c873ad4be9..b62f81b4873 100644
+--- a/llvm/test/Transforms/FunctionAttrs/liveness.ll
++++ b/llvm/test/Transforms/FunctionAttrs/liveness.ll
+@@ -48,7 +48,7 @@ define internal i32 @internal_load(i32*) norecurse nounwind uwtable {
+ ; TEST 1: Only first block is live.
+ 
+ ; CHECK: Function Attrs: nofree noreturn nosync nounwind
+-; CHECK-NEXT: define i32 @first_block_no_return(i32 %a, i32* nocapture nofree nonnull readonly %ptr1, i32* nocapture nofree readnone %ptr2)
++; CHECK-NEXT: define i32 @first_block_no_return(i32 %a, i32* nocapture nonnull readonly %ptr1, i32* nocapture readnone %ptr2)
+ define i32 @first_block_no_return(i32 %a, i32* nonnull %ptr1, i32* %ptr2) #0 {
+ entry:
+   call i32 @internal_load(i32* %ptr1)
+@@ -82,7 +82,7 @@ cond.end:                                         ; preds = %cond.false, %cond.t
+ ; dead block and check if it is deduced.
+ 
+ ; CHECK: Function Attrs: nosync
+-; CHECK-NEXT: define i32 @dead_block_present(i32 %a, i32* nocapture nofree readnone %ptr1)
++; CHECK-NEXT: define i32 @dead_block_present(i32 %a, i32* nocapture readnone %ptr1)
+ define i32 @dead_block_present(i32 %a, i32* %ptr1) #0 {
+ entry:
+   %cmp = icmp eq i32 %a, 0
+@@ -236,7 +236,7 @@ cleanup:
+ ; TEST 6: Undefined behvior, taken from LangRef.
+ ; FIXME: Should be able to detect undefined behavior.
+ 
+-; CHECK: define void @ub(i32* nocapture nofree writeonly %0)
++; CHECK: define void @ub(i32* nocapture writeonly %0)
+ define void @ub(i32* %0) {
+   %poison = sub nuw i32 0, 1           ; Results in a poison value.
+   %still_poison = and i32 %poison, 0   ; 0, but also poison.
+@@ -716,14 +716,14 @@ live_with_dead_entry:
+   ret void
+ }
+ 
+-; CHECK: define internal void @useless_arg_sink(i32* nocapture nofree readnone %a)
++; CHECK: define internal void @useless_arg_sink(i32* nocapture readnone %a)
+ define internal void @useless_arg_sink(i32* %a) {
+   ret void
+ }
+ 
+-; CHECK: define internal void @useless_arg_almost_sink(i32* nocapture nofree readnone %a)
++; CHECK: define internal void @useless_arg_almost_sink(i32* nocapture readnone %a)
+ define internal void @useless_arg_almost_sink(i32* %a) {
+-; CHECK: call void @useless_arg_sink(i32* nofree undef)
++; CHECK: call void @useless_arg_sink(i32* undef)
+   call void @useless_arg_sink(i32* %a)
+   ret void
+ }
+@@ -731,7 +731,7 @@ define internal void @useless_arg_almost_sink(i32* %a) {
+ ; Check we do not annotate the function interface of this weak function.
+ ; CHECK: define weak_odr void @useless_arg_ext(i32* %a)
+ define weak_odr void @useless_arg_ext(i32* %a) {
+-; CHECK: call void @useless_arg_almost_sink(i32* nofree undef)
++; CHECK: call void @useless_arg_almost_sink(i32* undef)
+   call void @useless_arg_almost_sink(i32* %a)
+   ret void
+ }
+diff --git a/llvm/test/Transforms/FunctionAttrs/misc.ll b/llvm/test/Transforms/FunctionAttrs/misc.ll
+index 8fc2799bf8c..ea4a5046fd0 100644
+--- a/llvm/test/Transforms/FunctionAttrs/misc.ll
++++ b/llvm/test/Transforms/FunctionAttrs/misc.ll
+@@ -10,7 +10,7 @@ define internal void @internal(void (i8*)* %fp) {
+ ; CHECK-NEXT:  entry:
+ ; CHECK-NEXT:    [[A:%.*]] = alloca i32, align 4
+ ; CHECK-NEXT:    [[TMP:%.*]] = bitcast i32* [[A]] to i8*
+-; CHECK-NEXT:    call void @foo(i32* nocapture nofree nonnull align 4 dereferenceable(4) undef)
++; CHECK-NEXT:    call void @foo(i32* nocapture nonnull align 4 dereferenceable(4) undef)
+ ; CHECK-NEXT:    call void [[FP:%.*]](i8* bitcast (void (i32*)* @foo to i8*))
+ ; CHECK-NEXT:    call void @callback1(void (i32*)* nonnull @foo)
+ ; CHECK-NEXT:    call void @callback2(void (i8*)* nonnull bitcast (void (i32*)* @foo to void (i8*)*))
+@@ -38,7 +38,7 @@ define void @external(void (i8*)* %fp) {
+ ; CHECK-NEXT:  entry:
+ ; CHECK-NEXT:    [[A:%.*]] = alloca i32, align 4
+ ; CHECK-NEXT:    [[TMP:%.*]] = bitcast i32* [[A]] to i8*
+-; CHECK-NEXT:    call void @foo(i32* nocapture nofree nonnull align 4 dereferenceable(4) undef)
++; CHECK-NEXT:    call void @foo(i32* nocapture nonnull align 4 dereferenceable(4) undef)
+ ; CHECK-NEXT:    call void @callback1(void (i32*)* nonnull @foo)
+ ; CHECK-NEXT:    call void @callback2(void (i8*)* nonnull bitcast (void (i32*)* @foo to void (i8*)*))
+ ; CHECK-NEXT:    call void @callback2(void (i8*)* [[FP:%.*]])
+@@ -64,7 +64,7 @@ entry:
+ 
+ define internal void @foo(i32* %a) {
+ ; CHECK-LABEL: define {{[^@]+}}@foo
+-; CHECK-SAME: (i32* nocapture nofree readnone [[A:%.*]])
++; CHECK-SAME: (i32* nocapture readnone [[A:%.*]])
+ ; CHECK-NEXT:  entry:
+ ; CHECK-NEXT:    ret void
+ ;
+diff --git a/llvm/test/Transforms/FunctionAttrs/noalias_returned.ll b/llvm/test/Transforms/FunctionAttrs/noalias_returned.ll
+index aba1a22ffa9..7c65a4350d0 100644
+--- a/llvm/test/Transforms/FunctionAttrs/noalias_returned.ll
++++ b/llvm/test/Transforms/FunctionAttrs/noalias_returned.ll
+@@ -153,7 +153,7 @@ define i8* @test8(i32* %0) nounwind uwtable {
+ ; TEST 9
+ ; Simple Argument Test
+ define internal void @test9(i8* %a, i8* %b) {
+-; CHECK: define internal void @test9(i8* noalias nocapture nofree readnone %a, i8* nocapture nofree readnone %b)
++; CHECK: define internal void @test9(i8* noalias nocapture readnone %a, i8* nocapture readnone %b)
+   ret void
+ }
+ define void @test9_helper(i8* %a, i8* %b) {
+diff --git a/llvm/test/Transforms/FunctionAttrs/nocapture.ll b/llvm/test/Transforms/FunctionAttrs/nocapture.ll
+index ac5f4f149dc..4fb45589648 100644
+--- a/llvm/test/Transforms/FunctionAttrs/nocapture.ll
++++ b/llvm/test/Transforms/FunctionAttrs/nocapture.ll
+@@ -6,13 +6,13 @@
+ @g = global i32* null		; <i32**> [#uses=1]
+ 
+ ; FNATTR: define i32* @c1(i32* readnone returned %q)
+-; ATTRIBUTOR: define i32* @c1(i32* nofree readnone returned "no-capture-maybe-returned" %q)
++; ATTRIBUTOR: define i32* @c1(i32* readnone returned "no-capture-maybe-returned" %q)
+ define i32* @c1(i32* %q) {
+ 	ret i32* %q
+ }
+ 
+ ; FNATTR: define void @c2(i32* %q)
+-; ATTRIBUTOR: define void @c2(i32* nofree writeonly %q)
++; ATTRIBUTOR: define void @c2(i32* writeonly %q)
+ ; It would also be acceptable to mark %q as readnone. Update @c3 too.
+ define void @c2(i32* %q) {
+ 	store i32* %q, i32** @g
+@@ -20,14 +20,14 @@ define void @c2(i32* %q) {
+ }
+ 
+ ; FNATTR: define void @c3(i32* %q)
+-; ATTRIBUTOR: define void @c3(i32* nofree writeonly %q)
++; ATTRIBUTOR: define void @c3(i32* writeonly %q)
+ define void @c3(i32* %q) {
+ 	call void @c2(i32* %q)
+ 	ret void
+ }
+ 
+ ; FNATTR: define i1 @c4(i32* %q, i32 %bitno)
+-; ATTRIBUTOR: define i1 @c4(i32* nofree readnone %q, i32 %bitno)
++; ATTRIBUTOR: define i1 @c4(i32* readnone %q, i32 %bitno)
+ define i1 @c4(i32* %q, i32 %bitno) {
+ 	%tmp = ptrtoint i32* %q to i32
+ 	%tmp2 = lshr i32 %tmp, %bitno
+@@ -41,7 +41,7 @@ l1:
+ 
+ ; c4b is c4 but without the escaping part
+ ; FNATTR: define i1 @c4b(i32* %q, i32 %bitno)
+-; ATTRIBUTOR: define i1 @c4b(i32* nocapture nofree readnone %q, i32 %bitno)
++; ATTRIBUTOR: define i1 @c4b(i32* nocapture readnone %q, i32 %bitno)
+ define i1 @c4b(i32* %q, i32 %bitno) {
+ 	%tmp = ptrtoint i32* %q to i32
+ 	%tmp2 = lshr i32 %tmp, %bitno
+@@ -56,7 +56,7 @@ l1:
+ @lookup_table = global [2 x i1] [ i1 0, i1 1 ]
+ 
+ ; FNATTR: define i1 @c5(i32* %q, i32 %bitno)
+-; ATTRIBUTOR: define i1 @c5(i32* nofree readonly %q, i32 %bitno)
++; ATTRIBUTOR: define i1 @c5(i32* readonly %q, i32 %bitno)
+ define i1 @c5(i32* %q, i32 %bitno) {
+ 	%tmp = ptrtoint i32* %q to i32
+ 	%tmp2 = lshr i32 %tmp, %bitno
+@@ -91,8 +91,7 @@ define i1* @lookup_bit(i32* %q, i32 %bitno) readnone nounwind {
+ 	ret i1* %lookup
+ }
+ 
+-; FNATTR: define i1 @c7(i32* readonly %q, i32 %bitno)
+-; ATTRIBUTOR: define i1 @c7(i32* nofree readonly %q, i32 %bitno)
++; EITHER: define i1 @c7(i32* readonly %q, i32 %bitno)
+ define i1 @c7(i32* %q, i32 %bitno) {
+ 	%ptr = call i1* @lookup_bit(i32* %q, i32 %bitno)
+ 	%val = load i1, i1* %ptr
+@@ -100,8 +99,7 @@ define i1 @c7(i32* %q, i32 %bitno) {
+ }
+ 
+ 
+-; FNATTR: define i32 @nc1(i32* %q, i32* nocapture %p, i1 %b)
+-; ATTRIBUTOR: define i32 @nc1(i32* nofree %q, i32* nocapture nofree %p, i1 %b)
++; EITHER: define i32 @nc1(i32* %q, i32* nocapture %p, i1 %b)
+ define i32 @nc1(i32* %q, i32* %p, i1 %b) {
+ e:
+ 	br label %l
+@@ -116,8 +114,7 @@ l:
+ 	ret i32 %val
+ }
+ 
+-; FNATTR: define i32 @nc1_addrspace(i32* %q, i32 addrspace(1)* nocapture %p, i1 %b)
+-; ATTRIBUTOR: define i32 @nc1_addrspace(i32* nofree %q, i32 addrspace(1)* nocapture nofree %p, i1 %b)
++; EITHER: define i32 @nc1_addrspace(i32* %q, i32 addrspace(1)* nocapture %p, i1 %b)
+ define i32 @nc1_addrspace(i32* %q, i32 addrspace(1)* %p, i1 %b) {
+ e:
+ 	br label %l
+@@ -132,8 +129,7 @@ l:
+ 	ret i32 %val
+ }
+ 
+-; FNATTR: define void @nc2(i32* nocapture %p, i32* %q)
+-; ATTRIBUTOR: define void @nc2(i32* nocapture nofree %p, i32* nofree %q)
++; EITHER: define void @nc2(i32* nocapture %p, i32* %q)
+ define void @nc2(i32* %p, i32* %q) {
+ 	%1 = call i32 @nc1(i32* %q, i32* %p, i1 0)		; <i32> [#uses=0]
+ 	ret void
+@@ -141,7 +137,7 @@ define void @nc2(i32* %p, i32* %q) {
+ 
+ 
+ ; FNATTR: define void @nc3(void ()* nocapture %p)
+-; ATTRIBUTOR: define void @nc3(void ()* nocapture nofree nonnull %p)
++; ATTRIBUTOR: define void @nc3(void ()* nocapture nonnull %p)
+ define void @nc3(void ()* %p) {
+ 	call void %p()
+ 	ret void
+@@ -155,7 +151,7 @@ define void @nc4(i8* %p) {
+ }
+ 
+ ; FNATTR: define void @nc5(void (i8*)* nocapture %f, i8* nocapture %p)
+-; ATTRIBUTOR: define void @nc5(void (i8*)* nocapture nofree nonnull %f, i8* nocapture %p)
++; ATTRIBUTOR: define void @nc5(void (i8*)* nocapture nonnull %f, i8* nocapture %p)
+ define void @nc5(void (i8*)* %f, i8* %p) {
+ 	call void %f(i8* %p) readonly nounwind
+ 	call void %f(i8* nocapture %p)
+@@ -163,7 +159,7 @@ define void @nc5(void (i8*)* %f, i8* %p) {
+ }
+ 
+ ; FNATTR:     define void @test1_1(i8* nocapture readnone %x1_1, i8* %y1_1, i1 %c)
+-; ATTRIBUTOR: define void @test1_1(i8* nocapture nofree readnone %x1_1, i8* nocapture nofree readnone %y1_1, i1 %c)
++; ATTRIBUTOR: define void @test1_1(i8* nocapture readnone %x1_1, i8* nocapture readnone %y1_1, i1 %c)
+ ; It would be acceptable to add readnone to %y1_1 and %y1_2.
+ define void @test1_1(i8* %x1_1, i8* %y1_1, i1 %c) {
+   call i8* @test1_2(i8* %x1_1, i8* %y1_1, i1 %c)
+@@ -172,7 +168,7 @@ define void @test1_1(i8* %x1_1, i8* %y1_1, i1 %c) {
+ }
+ 
+ ; FNATTR: define i8* @test1_2(i8* nocapture readnone %x1_2, i8* returned %y1_2, i1 %c)
+-; ATTRIBUTOR: define i8* @test1_2(i8* nocapture nofree readnone %x1_2, i8* nofree readnone returned "no-capture-maybe-returned" %y1_2, i1 %c)
++; ATTRIBUTOR: define i8* @test1_2(i8* nocapture readnone %x1_2, i8* readnone returned "no-capture-maybe-returned" %y1_2, i1 %c)
+ define i8* @test1_2(i8* %x1_2, i8* %y1_2, i1 %c) {
+   br i1 %c, label %t, label %f
+ t:
+@@ -183,16 +179,14 @@ f:
+   ret i8* %y1_2
+ }
+ 
+-; FNATTR: define void @test2(i8* nocapture readnone %x2)
+-; ATTRIBUTOR: define void @test2(i8* nocapture nofree readnone %x2)
++; EITHER: define void @test2(i8* nocapture readnone %x2)
+ define void @test2(i8* %x2) {
+   call void @test2(i8* %x2)
+   store i32* null, i32** @g
+   ret void
+ }
+ 
+-; FNATTR: define void @test3(i8* nocapture readnone %x3, i8* nocapture readnone %y3, i8* nocapture readnone %z3)
+-; ATTRIBUTOR: define void @test3(i8* nocapture nofree readnone %x3, i8* nocapture nofree readnone %y3, i8* nocapture nofree readnone %z3)
++; EITHER: define void @test3(i8* nocapture readnone %x3, i8* nocapture readnone %y3, i8* nocapture readnone %z3)
+ define void @test3(i8* %x3, i8* %y3, i8* %z3) {
+   call void @test3(i8* %z3, i8* %y3, i8* %x3)
+   store i32* null, i32** @g
+@@ -200,7 +194,7 @@ define void @test3(i8* %x3, i8* %y3, i8* %z3) {
+ }
+ 
+ ; FNATTR: define void @test4_1(i8* %x4_1, i1 %c)
+-; ATTRIBUTOR: define void @test4_1(i8* nocapture nofree readnone %x4_1, i1 %c)
++; ATTRIBUTOR: define void @test4_1(i8* nocapture readnone %x4_1, i1 %c)
+ define void @test4_1(i8* %x4_1, i1 %c) {
+   call i8* @test4_2(i8* %x4_1, i8* %x4_1, i8* %x4_1, i1 %c)
+   store i32* null, i32** @g
+@@ -208,7 +202,7 @@ define void @test4_1(i8* %x4_1, i1 %c) {
+ }
+ 
+ ; FNATTR: define i8* @test4_2(i8* nocapture readnone %x4_2, i8* readnone returned %y4_2, i8* nocapture readnone %z4_2, i1 %c)
+-; ATTRIBUTOR: define i8* @test4_2(i8* nocapture nofree readnone %x4_2, i8* nofree readnone returned "no-capture-maybe-returned" %y4_2, i8* nocapture nofree readnone %z4_2, i1 %c)
++; ATTRIBUTOR: define i8* @test4_2(i8* nocapture readnone %x4_2, i8* readnone returned "no-capture-maybe-returned" %y4_2, i8* nocapture readnone %z4_2, i1 %c)
+ define i8* @test4_2(i8* %x4_2, i8* %y4_2, i8* %z4_2, i1 %c) {
+   br i1 %c, label %t, label %f
+ t:
+@@ -238,28 +232,27 @@ define void @test6_2(i8* %x6_2, i8* %y6_2, i8* %z6_2) {
+ }
+ 
+ ; FNATTR: define void @test_cmpxchg(i32* nocapture %p)
+-; ATTRIBUTOR: define void @test_cmpxchg(i32* nocapture nofree nonnull dereferenceable(4) %p)
++; ATTRIBUTOR: define void @test_cmpxchg(i32* nocapture nonnull dereferenceable(4) %p)
+ define void @test_cmpxchg(i32* %p) {
+   cmpxchg i32* %p, i32 0, i32 1 acquire monotonic
+   ret void
+ }
+ 
+ ; FNATTR: define void @test_cmpxchg_ptr(i32** nocapture %p, i32* %q)
+-; ATTRIBUTOR: define void @test_cmpxchg_ptr(i32** nocapture nofree nonnull dereferenceable(8) %p, i32* nofree %q)
++; ATTRIBUTOR: define void @test_cmpxchg_ptr(i32** nocapture nonnull dereferenceable(8) %p, i32* %q)
+ define void @test_cmpxchg_ptr(i32** %p, i32* %q) {
+   cmpxchg i32** %p, i32* null, i32* %q acquire monotonic
+   ret void
+ }
+ 
+ ; FNATTR: define void @test_atomicrmw(i32* nocapture %p)
+-; ATTRIBUTOR: define void @test_atomicrmw(i32* nocapture nofree nonnull dereferenceable(4) %p)
++; ATTRIBUTOR: define void @test_atomicrmw(i32* nocapture nonnull dereferenceable(4) %p)
+ define void @test_atomicrmw(i32* %p) {
+   atomicrmw add i32* %p, i32 1 seq_cst
+   ret void
+ }
+ 
+-; FNATTR: define void @test_volatile(i32* %x)
+-; ATTRIBUTOR: define void @test_volatile(i32* nofree %x)
++; EITHER: define void @test_volatile(i32* %x)
+ define void @test_volatile(i32* %x) {
+ entry:
+   %gep = getelementptr i32, i32* %x, i64 1
+@@ -301,22 +294,20 @@ define void @captureStrip(i8* %p) {
+   ret void
+ }
+ 
+-; FNATTR: define i1 @captureICmp(i32* readnone %x)
+-; ATTRIBUTOR: define i1 @captureICmp(i32* nofree readnone %x)
++; EITHER: define i1 @captureICmp(i32* readnone %x)
+ define i1 @captureICmp(i32* %x) {
+   %1 = icmp eq i32* %x, null
+   ret i1 %1
+ }
+ 
+-; FNATTR: define i1 @captureICmpRev(i32* readnone %x)
+-; ATTRIBUTOR: define i1 @captureICmpRev(i32* nofree readnone %x)
++; EITHER: define i1 @captureICmpRev(i32* readnone %x)
+ define i1 @captureICmpRev(i32* %x) {
+   %1 = icmp eq i32* null, %x
+   ret i1 %1
+ }
+ 
+ ; FNATTR: define i1 @nocaptureInboundsGEPICmp(i32* nocapture readnone %x)
+-; ATTRIBUTOR: define i1 @nocaptureInboundsGEPICmp(i32* nocapture nofree nonnull readnone %x)
++; ATTRIBUTOR: define i1 @nocaptureInboundsGEPICmp(i32* nocapture nonnull readnone %x)
+ define i1 @nocaptureInboundsGEPICmp(i32* %x) {
+   %1 = getelementptr inbounds i32, i32* %x, i32 5
+   %2 = bitcast i32* %1 to i8*
+@@ -325,7 +316,7 @@ define i1 @nocaptureInboundsGEPICmp(i32* %x) {
+ }
+ 
+ ; FNATTR: define i1 @nocaptureInboundsGEPICmpRev(i32* nocapture readnone %x)
+-; ATTRIBUTOR: define i1 @nocaptureInboundsGEPICmpRev(i32* nocapture nofree nonnull readnone %x)
++; ATTRIBUTOR: define i1 @nocaptureInboundsGEPICmpRev(i32* nocapture nonnull readnone %x)
+ define i1 @nocaptureInboundsGEPICmpRev(i32* %x) {
+   %1 = getelementptr inbounds i32, i32* %x, i32 5
+   %2 = bitcast i32* %1 to i8*
+@@ -333,16 +324,14 @@ define i1 @nocaptureInboundsGEPICmpRev(i32* %x) {
+   ret i1 %3
+ }
+ 
+-; FNATTR: define i1 @nocaptureDereferenceableOrNullICmp(i32* nocapture readnone dereferenceable_or_null(4) %x)
+-; ATTRIBUTOR: define i1 @nocaptureDereferenceableOrNullICmp(i32* nocapture nofree readnone dereferenceable_or_null(4) %x)
++; EITHER: define i1 @nocaptureDereferenceableOrNullICmp(i32* nocapture readnone dereferenceable_or_null(4) %x)
+ define i1 @nocaptureDereferenceableOrNullICmp(i32* dereferenceable_or_null(4) %x) {
+   %1 = bitcast i32* %x to i8*
+   %2 = icmp eq i8* %1, null
+   ret i1 %2
+ }
+ 
+-; FNATTR: define i1 @captureDereferenceableOrNullICmp(i32* readnone dereferenceable_or_null(4) %x)
+-; ATTRIBUTOR: define i1 @captureDereferenceableOrNullICmp(i32* nofree readnone dereferenceable_or_null(4) %x)
++; EITHER: define i1 @captureDereferenceableOrNullICmp(i32* readnone dereferenceable_or_null(4) %x)
+ define i1 @captureDereferenceableOrNullICmp(i32* dereferenceable_or_null(4) %x) "null-pointer-is-valid"="true" {
+   %1 = bitcast i32* %x to i8*
+   %2 = icmp eq i8* %1, null
+diff --git a/llvm/test/Transforms/FunctionAttrs/nofree-attributor.ll b/llvm/test/Transforms/FunctionAttrs/nofree-attributor.ll
+index f1033d6f673..8015077f903 100644
+--- a/llvm/test/Transforms/FunctionAttrs/nofree-attributor.ll
++++ b/llvm/test/Transforms/FunctionAttrs/nofree-attributor.ll
+@@ -240,35 +240,6 @@ define void @f2() #0 {
+     ret void
+ }
+ 
+-; TEST 12 NoFree argument - positive.
+-; ATTRIBUTOR: define double @test12(double* nocapture nofree nonnull readonly dereferenceable(8) %a) 
+-define double @test12(double* nocapture readonly %a) {
+-entry:
+-	  %0 = load double, double* %a, align 8
+-	    %call = tail call double @cos(double %0) #2
+-	      ret double %call
+-}
+-
+-declare double @cos(double) nobuiltin nounwind nofree
+-
+-; FIXME: %a should be nofree.
+-; TEST 13 NoFree argument - positive.
+-; ATTRIBUTOR: define noalias i32* @test13(i64* nocapture nonnull readonly dereferenceable(8) %a)
+-define noalias i32* @test13(i64* nocapture readonly %a) {
+-entry:
+-	  %0 = load i64, i64* %a, align 8
+-	    %call = tail call noalias i8* @malloc(i64 %0) #2
+-	      %1 = bitcast i8* %call to i32*
+-	        ret i32* %1
+-}
+-
+-; ATTRIBUTOR: define void @test14(i8* nocapture %0, i8* nocapture nofree readnone %1)
+-define void @test14(i8* nocapture %0, i8* nocapture %1) {
+-	    tail call void @free(i8* %0) #1
+-	        ret void
+-}
+-
+-declare noalias i8* @malloc(i64)
+ 
+ attributes #0 = { nounwind uwtable noinline }
+ attributes #1 = { nounwind }
+diff --git a/llvm/test/Transforms/FunctionAttrs/nonnull.ll b/llvm/test/Transforms/FunctionAttrs/nonnull.ll
+index 478e36cf658..cea4785d058 100644
+--- a/llvm/test/Transforms/FunctionAttrs/nonnull.ll
++++ b/llvm/test/Transforms/FunctionAttrs/nonnull.ll
+@@ -1,8 +1,8 @@
+ ; NOTE: Assertions have been autogenerated by utils/update_test_checks.py
+ ; RUN: opt -S -functionattrs -enable-nonnull-arg-prop %s | FileCheck %s --check-prefixes=BOTH,FNATTR,OLD
+ ; RUN: opt -S -passes=function-attrs -enable-nonnull-arg-prop %s | FileCheck %s --check-prefixes=BOTH,FNATTR,OLD
+-; RUN: opt -attributor --attributor-disable=false -attributor-max-iterations-verify -attributor-annotate-decl-cs -attributor-max-iterations=7 -S < %s | FileCheck %s --check-prefixes=BOTH,OLD,ATTRIBUTOR,ATTRIBUTOR_OPM
+-; RUN: opt -passes=attributor --attributor-disable=false -attributor-max-iterations-verify -attributor-annotate-decl-cs -attributor-max-iterations=7 -S < %s | FileCheck %s --check-prefixes=BOTH,ATTRIBUTOR,ATTRIBUTOR_NPM
++; RUN: opt -attributor --attributor-disable=false -attributor-max-iterations-verify -attributor-max-iterations=7 -S < %s | FileCheck %s --check-prefixes=BOTH,OLD,ATTRIBUTOR,ATTRIBUTOR_OPM
++; RUN: opt -passes=attributor --attributor-disable=false -attributor-max-iterations-verify -attributor-max-iterations=7 -S < %s | FileCheck %s --check-prefixes=BOTH,ATTRIBUTOR,ATTRIBUTOR_NPM
+ 
+ target datalayout = "e-m:e-i64:64-f80:128-n8:16:32:64-S128"
+ 
+diff --git a/llvm/test/Transforms/FunctionAttrs/norecurse.ll b/llvm/test/Transforms/FunctionAttrs/norecurse.ll
+index b18505eecbb..6a4d1180231 100644
+--- a/llvm/test/Transforms/FunctionAttrs/norecurse.ll
++++ b/llvm/test/Transforms/FunctionAttrs/norecurse.ll
+@@ -130,14 +130,14 @@ define linkonce_odr i32 @leaf_redefinable() {
+ 
+ ; Call through a function pointer
+ ; ATTRIBUTOR-NOT: Function Attrs
+-; ATTRIBUTOR: define i32 @eval_func1(i32 (i32)* nocapture nofree nonnull %0, i32 %1)
++; ATTRIBUTOR: define i32 @eval_func1(i32 (i32)* nocapture nonnull %0, i32 %1)
+ define i32 @eval_func1(i32 (i32)* , i32) local_unnamed_addr {
+   %3 = tail call i32 %0(i32 %1) #2
+   ret i32 %3
+ }
+ 
+ ; ATTRIBUTOR-NOT: Function Attrs
+-; ATTRIBUTOR: define i32 @eval_func2(i32 (i32)* nocapture nofree %0, i32 %1)
++; ATTRIBUTOR: define i32 @eval_func2(i32 (i32)* nocapture %0, i32 %1)
+ define i32 @eval_func2(i32 (i32)* , i32) local_unnamed_addr "null-pointer-is-valid"="true"{
+   %3 = tail call i32 %0(i32 %1) #2
+   ret i32 %3
+diff --git a/llvm/test/Transforms/FunctionAttrs/nosync.ll b/llvm/test/Transforms/FunctionAttrs/nosync.ll
+index bfcf678b3fa..253b34d8308 100644
+--- a/llvm/test/Transforms/FunctionAttrs/nosync.ll
++++ b/llvm/test/Transforms/FunctionAttrs/nosync.ll
+@@ -28,7 +28,7 @@ target datalayout = "e-m:e-i64:64-f80:128-n8:16:32:64-S128"
+ ; FNATTR: Function Attrs: norecurse nounwind optsize readnone ssp uwtable
+ ; FNATTR-NEXT: define nonnull i32* @foo(%struct.ST* readnone %s)
+ ; ATTRIBUTOR: Function Attrs: nofree nosync nounwind optsize readnone ssp uwtable
+-; ATTRIBUTOR-NEXT: define nonnull i32* @foo(%struct.ST* nofree nonnull readnone "no-capture-maybe-returned" %s)
++; ATTRIBUTOR-NEXT: define nonnull i32* @foo(%struct.ST* nonnull readnone "no-capture-maybe-returned" %s)
+ define i32* @foo(%struct.ST* %s) nounwind uwtable readnone optsize ssp {
+ entry:
+   %arrayidx = getelementptr inbounds %struct.ST, %struct.ST* %s, i64 1, i32 2, i32 1, i64 5, i64 13
+@@ -45,7 +45,7 @@ entry:
+ ; FNATTR: Function Attrs: nofree norecurse nounwind uwtable
+ ; FNATTR-NEXT: define i32 @load_monotonic(i32* nocapture readonly %0)
+ ; ATTRIBUTOR: Function Attrs: nofree norecurse nosync nounwind uwtable
+-; ATTRIBUTOR-NEXT: define i32 @load_monotonic(i32* nocapture nofree nonnull readonly dereferenceable(4) %0)
++; ATTRIBUTOR-NEXT: define i32 @load_monotonic(i32* nocapture nonnull readonly dereferenceable(4) %0)
+ define i32 @load_monotonic(i32* nocapture readonly %0) norecurse nounwind uwtable {
+   %2 = load atomic i32, i32* %0 monotonic, align 4
+   ret i32 %2
+@@ -61,7 +61,7 @@ define i32 @load_monotonic(i32* nocapture readonly %0) norecurse nounwind uwtabl
+ ; FNATTR: Function Attrs: nofree norecurse nounwind uwtable
+ ; FNATTR-NEXT: define void @store_monotonic(i32* nocapture %0)
+ ; ATTRIBUTOR: Function Attrs: nofree norecurse nosync nounwind uwtable
+-; ATTRIBUTOR-NEXT: define void @store_monotonic(i32* nocapture nofree nonnull writeonly dereferenceable(4) %0) 
++; ATTRIBUTOR-NEXT: define void @store_monotonic(i32* nocapture nonnull writeonly dereferenceable(4) %0) 
+ define void @store_monotonic(i32* nocapture %0) norecurse nounwind uwtable {
+   store atomic i32 10, i32* %0 monotonic, align 4
+   ret void
+@@ -78,7 +78,7 @@ define void @store_monotonic(i32* nocapture %0) norecurse nounwind uwtable {
+ ; FNATTR-NEXT: define i32 @load_acquire(i32* nocapture readonly %0)
+ ; ATTRIBUTOR: Function Attrs: nofree norecurse nounwind uwtable
+ ; ATTRIBUTOR-NOT: nosync
+-; ATTRIBUTOR-NEXT: define i32 @load_acquire(i32* nocapture nofree nonnull readonly dereferenceable(4) %0)
++; ATTRIBUTOR-NEXT: define i32 @load_acquire(i32* nocapture nonnull readonly dereferenceable(4) %0)
+ define i32 @load_acquire(i32* nocapture readonly %0) norecurse nounwind uwtable {
+   %2 = load atomic i32, i32* %0 acquire, align 4
+   ret i32 %2
+@@ -94,7 +94,7 @@ define i32 @load_acquire(i32* nocapture readonly %0) norecurse nounwind uwtable
+ ; FNATTR-NEXT: define void @load_release(i32* nocapture %0)
+ ; ATTRIBUTOR: Function Attrs: nofree norecurse nounwind uwtable
+ ; ATTRIBUTOR-NOT: nosync
+-; ATTRIBUTOR-NEXT: define void @load_release(i32* nocapture nofree writeonly %0)
++; ATTRIBUTOR-NEXT: define void @load_release(i32* nocapture writeonly %0)
+ define void @load_release(i32* nocapture %0) norecurse nounwind uwtable {
+   store atomic volatile i32 10, i32* %0 release, align 4
+   ret void
+@@ -106,7 +106,7 @@ define void @load_release(i32* nocapture %0) norecurse nounwind uwtable {
+ ; FNATTR-NEXT: define void @load_volatile_release(i32* nocapture %0)
+ ; ATTRIBUTOR: Function Attrs: nofree norecurse nounwind uwtable
+ ; ATTRIBUTOR-NOT: nosync
+-; ATTRIBUTOR-NEXT: define void @load_volatile_release(i32* nocapture nofree writeonly %0)
++; ATTRIBUTOR-NEXT: define void @load_volatile_release(i32* nocapture writeonly %0)
+ define void @load_volatile_release(i32* nocapture %0) norecurse nounwind uwtable {
+   store atomic volatile i32 10, i32* %0 release, align 4
+   ret void
+@@ -122,7 +122,7 @@ define void @load_volatile_release(i32* nocapture %0) norecurse nounwind uwtable
+ ; FNATTR-NEXT: define void @volatile_store(i32* %0)
+ ; ATTRIBUTOR: Function Attrs: nofree norecurse nounwind uwtable
+ ; ATTRIBUTOR-NOT: nosync
+-; ATTRIBUTOR-NEXT: define void @volatile_store(i32* nofree %0)
++; ATTRIBUTOR-NEXT: define void @volatile_store(i32* %0)
+ define void @volatile_store(i32* %0) norecurse nounwind uwtable {
+   store volatile i32 14, i32* %0, align 4
+   ret void
+@@ -139,7 +139,7 @@ define void @volatile_store(i32* %0) norecurse nounwind uwtable {
+ ; FNATTR-NEXT: define i32 @volatile_load(i32* %0)
+ ; ATTRIBUTOR: Function Attrs: nofree norecurse nounwind uwtable
+ ; ATTRIBUTOR-NOT: nosync
+-; ATTRIBUTOR-NEXT: define i32 @volatile_load(i32* nofree %0)
++; ATTRIBUTOR-NEXT: define i32 @volatile_load(i32* %0)
+ define i32 @volatile_load(i32* %0) norecurse nounwind uwtable {
+   %2 = load volatile i32, i32* %0, align 4
+   ret i32 %2
+@@ -186,7 +186,7 @@ define void @call_might_sync() nounwind uwtable noinline {
+ ; FNATTR: Function Attrs: nofree noinline nounwind uwtable
+ ; FNATTR-NEXT: define i32 @scc1(i32* %0)
+ ; ATTRIBUTOR: Function Attrs: nofree noinline noreturn nosync nounwind readnone uwtable
+-; ATTRIBUTOR-NEXT: define i32 @scc1(i32* nocapture nofree readnone %0)
++; ATTRIBUTOR-NEXT: define i32 @scc1(i32* nocapture readnone %0)
+ define i32 @scc1(i32* %0) noinline nounwind uwtable {
+   tail call void @scc2(i32* %0);
+   %val = tail call i32 @volatile_load(i32* %0);
+@@ -196,7 +196,7 @@ define i32 @scc1(i32* %0) noinline nounwind uwtable {
+ ; FNATTR: Function Attrs: nofree noinline nounwind uwtable
+ ; FNATTR-NEXT: define void @scc2(i32* %0)
+ ; ATTRIBUTOR: Function Attrs: nofree noinline noreturn nosync nounwind readnone uwtable
+-; ATTRIBUTOR-NEXT: define void @scc2(i32* nocapture nofree readnone %0)
++; ATTRIBUTOR-NEXT: define void @scc2(i32* nocapture readnone %0)
+ define void @scc2(i32* %0) noinline nounwind uwtable {
+   tail call i32 @scc1(i32* %0);
+   ret void;
+@@ -224,7 +224,7 @@ define void @scc2(i32* %0) noinline nounwind uwtable {
+ ; FNATTR: Function Attrs: nofree norecurse nounwind
+ ; FNATTR-NEXT: define void @foo1(i32* nocapture %0, %"struct.std::atomic"* nocapture %1)
+ ; ATTRIBUTOR-NOT: nosync
+-; ATTRIBUTOR: define void @foo1(i32* nocapture nofree nonnull writeonly dereferenceable(4) %0, %"struct.std::atomic"* nocapture nofree nonnull writeonly dereferenceable(1) %1)
++; ATTRIBUTOR: define void @foo1(i32* nocapture nonnull writeonly dereferenceable(4) %0, %"struct.std::atomic"* nocapture nonnull writeonly dereferenceable(1) %1)
+ 
+ define void @foo1(i32* %0, %"struct.std::atomic"* %1) {
+   store i32 100, i32* %0, align 4
+@@ -237,7 +237,7 @@ define void @foo1(i32* %0, %"struct.std::atomic"* %1) {
+ ; FNATTR: Function Attrs: nofree norecurse nounwind
+ ; FNATTR-NEXT: define void @bar(i32* nocapture readnone %0, %"struct.std::atomic"* nocapture readonly %1)
+ ; ATTRIBUTOR-NOT: nosync
+-; ATTRIBUTOR: define void @bar(i32* nocapture nofree readnone %0, %"struct.std::atomic"* nocapture nofree nonnull readonly dereferenceable(1) %1)
++; ATTRIBUTOR: define void @bar(i32* nocapture readnone %0, %"struct.std::atomic"* nocapture nonnull readonly dereferenceable(1) %1)
+ define void @bar(i32* %0, %"struct.std::atomic"* %1) {
+   %3 = getelementptr inbounds %"struct.std::atomic", %"struct.std::atomic"* %1, i64 0, i32 0, i32 0
+   br label %4
+@@ -257,7 +257,7 @@ define void @bar(i32* %0, %"struct.std::atomic"* %1) {
+ ; FNATTR: Function Attrs: nofree norecurse nounwind
+ ; FNATTR-NEXT: define void @foo1_singlethread(i32* nocapture %0, %"struct.std::atomic"* nocapture %1)
+ ; ATTRIBUTOR: Function Attrs: nofree nosync nounwind willreturn
+-; ATTRIBUTOR: define void @foo1_singlethread(i32* nocapture nofree nonnull writeonly dereferenceable(4) %0, %"struct.std::atomic"* nocapture nofree nonnull writeonly dereferenceable(1) %1)
++; ATTRIBUTOR: define void @foo1_singlethread(i32* nocapture nonnull writeonly dereferenceable(4) %0, %"struct.std::atomic"* nocapture nonnull writeonly dereferenceable(1) %1)
+ 
+ define void @foo1_singlethread(i32* %0, %"struct.std::atomic"* %1) {
+   store i32 100, i32* %0, align 4
+@@ -270,7 +270,7 @@ define void @foo1_singlethread(i32* %0, %"struct.std::atomic"* %1) {
+ ; FNATTR: Function Attrs: nofree norecurse nounwind
+ ; FNATTR-NEXT: define void @bar_singlethread(i32* nocapture readnone %0, %"struct.std::atomic"* nocapture readonly %1)
+ ; ATTRIBUTOR: Function Attrs: nofree nosync nounwind
+-; ATTRIBUTOR: define void @bar_singlethread(i32* nocapture nofree readnone %0, %"struct.std::atomic"* nocapture nofree nonnull readonly dereferenceable(1) %1)
++; ATTRIBUTOR: define void @bar_singlethread(i32* nocapture readnone %0, %"struct.std::atomic"* nocapture nonnull readonly dereferenceable(1) %1)
+ define void @bar_singlethread(i32* %0, %"struct.std::atomic"* %1) {
+   %3 = getelementptr inbounds %"struct.std::atomic", %"struct.std::atomic"* %1, i64 0, i32 0, i32 0
+   br label %4
+diff --git a/llvm/test/Transforms/FunctionAttrs/read_write_returned_arguments_scc.ll b/llvm/test/Transforms/FunctionAttrs/read_write_returned_arguments_scc.ll
+index 6196406ace2..5f9e477679c 100644
+--- a/llvm/test/Transforms/FunctionAttrs/read_write_returned_arguments_scc.ll
++++ b/llvm/test/Transforms/FunctionAttrs/read_write_returned_arguments_scc.ll
+@@ -30,7 +30,7 @@
+ target datalayout = "e-m:e-i64:64-f80:128-n8:16:32:64-S128"
+ 
+ ; CHECK: Function Attrs: nofree nosync nounwind
+-; CHECK-NEXT: define i32* @external_ret2_nrw(i32* nofree %n0, i32* nofree %r0, i32* nofree returned %w0)
++; CHECK-NEXT: define i32* @external_ret2_nrw(i32* %n0, i32* %r0, i32* returned %w0)
+ define i32* @external_ret2_nrw(i32* %n0, i32* %r0, i32* %w0) {
+ entry:
+   %call = call i32* @internal_ret0_nw(i32* %n0, i32* %w0)
+@@ -41,7 +41,7 @@ entry:
+ }
+ 
+ ; CHECK: Function Attrs: nofree nosync nounwind
+-; CHECK-NEXT: define internal i32* @internal_ret0_nw(i32* nofree returned %n0, i32* nofree %w0)
++; CHECK-NEXT: define internal i32* @internal_ret0_nw(i32* returned %n0, i32* %w0)
+ define internal i32* @internal_ret0_nw(i32* %n0, i32* %w0) {
+ entry:
+   %r0 = alloca i32, align 4
+@@ -70,7 +70,7 @@ return:                                           ; preds = %if.end, %if.then
+ }
+ 
+ ; CHECK: Function Attrs: nofree nosync nounwind
+-; CHECK-NEXT: define internal i32* @internal_ret1_rrw(i32* nofree nonnull dereferenceable(4) %r0, i32* nofree returned %r1, i32* nofree %w0)
++; CHECK-NEXT: define internal i32* @internal_ret1_rrw(i32* nonnull dereferenceable(4) %r0, i32* returned %r1, i32* %w0)
+ define internal i32* @internal_ret1_rrw(i32* %r0, i32* %r1, i32* %w0) {
+ entry:
+   %0 = load i32, i32* %r0, align 4
+@@ -102,7 +102,7 @@ return:                                           ; preds = %if.end, %if.then
+ }
+ 
+ ; CHECK: Function Attrs: nofree norecurse nosync nounwind
+-; CHECK-NEXT: define i32* @external_sink_ret2_nrw(i32* nofree readnone %n0, i32* nocapture nofree readonly %r0, i32* nofree returned writeonly "no-capture-maybe-returned" %w0)
++; CHECK-NEXT: define i32* @external_sink_ret2_nrw(i32* readnone %n0, i32* nocapture readonly %r0, i32* returned writeonly "no-capture-maybe-returned" %w0)
+ define i32* @external_sink_ret2_nrw(i32* %n0, i32* %r0, i32* %w0) {
+ entry:
+   %tobool = icmp ne i32* %n0, null
+@@ -121,7 +121,7 @@ return:                                           ; preds = %if.end, %if.then
+ }
+ 
+ ; CHECK: Function Attrs: nofree nosync nounwind
+-; CHECK-NEXT: define internal i32* @internal_ret1_rw(i32* nofree nonnull dereferenceable(4) %r0, i32* nofree returned %w0)
++; CHECK-NEXT: define internal i32* @internal_ret1_rw(i32* nonnull dereferenceable(4) %r0, i32* returned %w0)
+ define internal i32* @internal_ret1_rw(i32* %r0, i32* %w0) {
+ entry:
+   %0 = load i32, i32* %r0, align 4
+@@ -147,7 +147,7 @@ return:                                           ; preds = %if.end, %if.then
+ }
+ 
+ ; CHECK: Function Attrs: nofree nosync nounwind
+-; CHECK-NEXT: define i32* @external_source_ret2_nrw(i32* nofree %n0, i32* nofree %r0, i32* nofree returned %w0)
++; CHECK-NEXT: define i32* @external_source_ret2_nrw(i32* %n0, i32* %r0, i32* returned %w0)
+ define i32* @external_source_ret2_nrw(i32* %n0, i32* %r0, i32* %w0) {
+ entry:
+   %call = call i32* @external_sink_ret2_nrw(i32* %n0, i32* %r0, i32* %w0)
+diff --git a/llvm/test/Transforms/FunctionAttrs/readattrs.ll b/llvm/test/Transforms/FunctionAttrs/readattrs.ll
+index 6ebfb99c5f1..cccdeaad765 100644
+--- a/llvm/test/Transforms/FunctionAttrs/readattrs.ll
++++ b/llvm/test/Transforms/FunctionAttrs/readattrs.ll
+@@ -18,14 +18,13 @@ define void @test1_2(i8* %x1_2, i8* %y1_2, i8* %z1_2) {
+ }
+ 
+ ; FNATTR: define i8* @test2(i8* readnone returned %p)
+-; ATTRIBUTOR: define i8* @test2(i8* nofree readnone returned %p)
++; ATTRIBUTOR: define i8* @test2(i8* readnone returned %p)
+ define i8* @test2(i8* %p) {
+   store i32 0, i32* @x
+   ret i8* %p
+ }
+ 
+-; FNATTR: define i1 @test3(i8* readnone %p, i8* readnone %q)
+-; ATTRIBUTOR: define i1 @test3(i8* nofree readnone %p, i8* nofree readnone %q)
++; CHECK: define i1 @test3(i8* readnone %p, i8* readnone %q)
+ define i1 @test3(i8* %p, i8* %q) {
+   %A = icmp ult i8* %p, %q
+   ret i1 %A
+@@ -40,7 +39,7 @@ define void @test4_2(i8* %p) {
+ }
+ 
+ ; FNATTR: define void @test5(i8** nocapture %p, i8* %q)
+-; ATTRIBUTOR: define void @test5(i8** nocapture nofree nonnull writeonly dereferenceable(8) %p, i8* nofree writeonly %q)
++; ATTRIBUTOR: define void @test5(i8** nocapture nonnull writeonly dereferenceable(8) %p, i8* writeonly %q)
+ ; Missed optz'n: we could make %q readnone, but don't break test6!
+ define void @test5(i8** %p, i8* %q) {
+   store i8* %q, i8** %p
+@@ -58,21 +57,21 @@ define void @test6_2(i8** %p, i8* %q) {
+ }
+ 
+ ; FNATTR: define void @test7_1(i32* inalloca nocapture %a)
+-; ATTRIBUTOR: define void @test7_1(i32* inalloca nocapture nofree writeonly %a)
++; ATTRIBUTOR: define void @test7_1(i32* inalloca nocapture writeonly %a)
+ ; inalloca parameters are always considered written
+ define void @test7_1(i32* inalloca %a) {
+   ret void
+ }
+ 
+ ; FNATTR: define i32* @test8_1(i32* readnone returned %p)
+-; ATTRIBUTOR: define i32* @test8_1(i32* nofree readnone returned %p)
++; ATTRIBUTOR: define i32* @test8_1(i32* readnone returned %p)
+ define i32* @test8_1(i32* %p) {
+ entry:
+   ret i32* %p
+ }
+ 
+ ; FNATTR: define void @test8_2(i32* %p)
+-; ATTRIBUTOR: define void @test8_2(i32* nocapture nofree writeonly %p)
++; ATTRIBUTOR: define void @test8_2(i32* nocapture writeonly %p)
+ define void @test8_2(i32* %p) {
+ entry:
+   %call = call i32* @test8_1(i32* %p)
+@@ -139,8 +138,8 @@ declare void @escape_readonly_ptr(i8** %addr, i8* readonly %ptr)
+ ; FNATTR: define void @unsound_readnone(i8* nocapture readnone %ignored, i8* readnone %escaped_then_written)
+ ; FNATTR: define void @unsound_readonly(i8* nocapture readnone %ignored, i8* readonly %escaped_then_written)
+ ;
+-; ATTRIBUTOR: define void @unsound_readnone(i8* nocapture nofree readnone %ignored, i8* %escaped_then_written)
+-; ATTRIBUTOR: define void @unsound_readonly(i8* nocapture nofree readnone %ignored, i8* %escaped_then_written)
++; ATTRIBUTOR: define void @unsound_readnone(i8* nocapture readnone %ignored, i8* %escaped_then_written)
++; ATTRIBUTOR: define void @unsound_readonly(i8* nocapture readnone %ignored, i8* %escaped_then_written)
+ define void @unsound_readnone(i8* %ignored, i8* %escaped_then_written) {
+   %addr = alloca i8*
+   call void @escape_readnone_ptr(i8** %addr, i8* %escaped_then_written)
+diff --git a/llvm/test/Transforms/FunctionAttrs/willreturn.ll b/llvm/test/Transforms/FunctionAttrs/willreturn.ll
+index 75b2f274769..2528382d9bd 100644
+--- a/llvm/test/Transforms/FunctionAttrs/willreturn.ll
++++ b/llvm/test/Transforms/FunctionAttrs/willreturn.ll
+@@ -338,7 +338,7 @@ declare i32 @__gxx_personality_v0(...)
+ ; FNATTR: Function Attrs: noinline norecurse nounwind readonly uwtable
+ ; FNATTR-NEXT: define i32 @loop_constant_trip_count(i32* nocapture readonly %0)
+ ; ATTRIBUTOR: Function Attrs: nofree noinline norecurse nosync nounwind readonly uwtable
+-; ATTRIBUTOR-NEXT: define i32 @loop_constant_trip_count(i32* nocapture nofree readonly %0)
++; ATTRIBUTOR-NEXT: define i32 @loop_constant_trip_count(i32* nocapture readonly %0)
+ define i32 @loop_constant_trip_count(i32* nocapture readonly %0) #0 {
+   br label %3
+ 
+@@ -372,7 +372,7 @@ define i32 @loop_constant_trip_count(i32* nocapture readonly %0) #0 {
+ ; FNATTR-NEXT: define i32 @loop_trip_count_unbound(i32 %0, i32 %1, i32* nocapture readonly %2, i32 %3) local_unnamed_addr
+ ; ATTRIBUTOR: Function Attrs: nofree noinline norecurse nosync nounwind readonly uwtable
+ ; ATTRIBUTOR-NOT: willreturn
+-; ATTRIBUTOR-NEXT: define i32 @loop_trip_count_unbound(i32 %0, i32 %1, i32* nocapture nofree readonly %2, i32 %3) local_unnamed_addr
++; ATTRIBUTOR-NEXT: define i32 @loop_trip_count_unbound(i32 %0, i32 %1, i32* nocapture readonly %2, i32 %3) local_unnamed_addr
+ define i32 @loop_trip_count_unbound(i32 %0, i32 %1, i32* nocapture readonly %2, i32 %3) local_unnamed_addr #0 {
+   %5 = icmp eq i32 %0, %1
+   br i1 %5, label %6, label %8
+@@ -409,7 +409,7 @@ define i32 @loop_trip_count_unbound(i32 %0, i32 %1, i32* nocapture readonly %2,
+ ; FNATTR: Function Attrs: noinline norecurse nounwind readonly uwtable
+ ; FNATTR-NEXT: define i32 @loop_trip_dec(i32 %0, i32* nocapture readonly %1)
+ ; ATTRIBUTOR: Function Attrs: nofree noinline norecurse nosync nounwind readonly uwtable
+-; ATTRIBUTOR-NEXT: define i32 @loop_trip_dec(i32 %0, i32* nocapture nofree readonly %1) local_unnamed_addr
++; ATTRIBUTOR-NEXT: define i32 @loop_trip_dec(i32 %0, i32* nocapture readonly %1) local_unnamed_addr
+ 
+ define i32 @loop_trip_dec(i32 %0, i32* nocapture readonly %1) local_unnamed_addr #0 {
+   %3 = icmp sgt i32 %0, -1
